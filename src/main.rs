@@ -3,17 +3,21 @@ use std::{
     ffi::OsStr,
     fs,
     io::{self, BufWriter, ErrorKind, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
     sync::{Arc, Mutex, mpsc},
     thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+        MouseEventKind,
+    },
     execute,
     terminal::{
         self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -22,14 +26,22 @@ use crossterm::{
 };
 
 const DEFAULT_WIDTH: u32 = 640;
-const DEFAULT_HEIGHT: u32 = 360;
+const DEFAULT_HEIGHT: u32 = 480;
 const DEFAULT_FPS: u32 = 30;
 const DEFAULT_DEVICE: &str = "/dev/video0";
 const KITTY_IMAGE_ID: u32 = 0x4c_55_4d; // "LUM", within the 24-bit foreground-color-safe range.
 const KITTY_IMAGE_IDS: [u32; 2] = [KITTY_IMAGE_ID, KITTY_IMAGE_ID + 1];
+const KITTY_THUMBNAIL_IMAGE_IDS: [u32; 2] = [KITTY_IMAGE_ID + 10, KITTY_IMAGE_ID + 11];
 const KITTY_PLACEMENT_ID: u32 = 1;
+const KITTY_THUMBNAIL_PLACEMENT_ID: u32 = 2;
 const RAW_RGB_BYTES_PER_PIXEL: usize = 3;
 const KITTY_RAW_CHUNK_BYTES: usize = 3 * 4096 / 4;
+const SIDEBAR_COLS: u16 = 16;
+const MIN_PREVIEW_COLS: u16 = 20;
+const MIN_SIDEBAR_COLS: u16 = 12;
+const THUMBNAIL_SIZE: u32 = 160;
+const SIDEBAR_DIM: &str = "\x1b[38;2;80;84;92m";
+const SIDEBAR_HOT: &str = "\x1b[38;2;245;245;246m";
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -39,6 +51,7 @@ struct Config {
     fps: u32,
     force: bool,
     mirror_horizontal: bool,
+    camera_dir: PathBuf,
 }
 
 impl Default for Config {
@@ -50,7 +63,25 @@ impl Default for Config {
             fps: DEFAULT_FPS,
             force: false,
             mirror_horizontal: false,
+            camera_dir: default_camera_dir(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Rect {
+    x: u16,
+    y: u16,
+    cols: u16,
+    rows: u16,
+}
+
+impl Rect {
+    fn contains(self, x: u16, y: u16) -> bool {
+        x >= self.x
+            && x < self.x.saturating_add(self.cols)
+            && y >= self.y
+            && y < self.y.saturating_add(self.rows)
     }
 }
 
@@ -60,6 +91,38 @@ struct ImageArea {
     y: u16,
     cols: u16,
     rows: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UiLayout {
+    preview_area: ImageArea,
+    sidebar: Rect,
+    capture_button: Option<Rect>,
+    thumbnail_area: Option<ImageArea>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KittyFramePlacement {
+    image_id: u32,
+    placement_id: u32,
+    z_index: i32,
+    previous_image_id: Option<u32>,
+    width: u32,
+    height: u32,
+    area: ImageArea,
+}
+
+#[derive(Clone, Debug)]
+struct CaptureThumbnail {
+    path: PathBuf,
+    frame: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputEvent {
+    Quit,
+    Capture,
+    Click { x: u16, y: u16 },
 }
 
 fn main() {
@@ -91,12 +154,18 @@ fn run() -> Result<()> {
     let stdout = io::stdout();
     let mut out = BufWriter::with_capacity(frame_len + frame_len / 2, stdout.lock());
     let mut kitty_sequence = Vec::with_capacity(frame_len + frame_len / 2 + 4096);
-    let mut last_area = None;
+    let mut last_layout = None;
     let mut previous_image_id = None;
+    let mut previous_thumbnail_image_id = None;
     let mut frame_serial = 0_u32;
+    let mut thumbnail_serial = 0_u32;
+    let mut last_thumbnail = latest_capture_thumbnail(&config.camera_dir, THUMBNAIL_SIZE);
+    let mut thumbnail_dirty = last_thumbnail.is_some();
+    let mut next_thumbnail_rescan = Instant::now() + Duration::from_millis(750);
+    let mut capture_requested = false;
 
     loop {
-        if stop_rx.try_recv().is_ok() {
+        if drain_input_events(&stop_rx, last_layout, &mut capture_requested) {
             break;
         }
 
@@ -113,34 +182,88 @@ fn run() -> Result<()> {
             Err(error) => bail!("failed to read camera frame: {error}"),
         }
 
-        if stop_rx.try_recv().is_ok() {
+        if drain_input_events(&stop_rx, last_layout, &mut capture_requested) {
             break;
         }
 
-        let area = image_area(config.width, config.height);
-        if last_area != Some(area) {
+        let layout = ui_layout(config.width, config.height);
+        if last_layout != Some(layout) {
             clear_screen_and_images(&mut out)?;
-            last_area = Some(area);
+            draw_sidebar(&mut out, layout)?;
+            last_layout = Some(layout);
             previous_image_id = None;
+            previous_thumbnail_image_id = None;
             frame_serial = 0;
+            thumbnail_dirty = true;
+        }
+
+        if capture_requested {
+            let path = save_capture(&config, &frame)?;
+            last_thumbnail = Some(CaptureThumbnail {
+                path,
+                frame: square_thumbnail(&frame, config.width, config.height, THUMBNAIL_SIZE),
+            });
+            thumbnail_dirty = true;
+            next_thumbnail_rescan = Instant::now() + Duration::from_millis(750);
+            capture_requested = false;
+        }
+
+        if Instant::now() >= next_thumbnail_rescan {
+            let current_path = last_thumbnail
+                .as_ref()
+                .map(|thumbnail| thumbnail.path.as_path());
+            if latest_image_path(&config.camera_dir).as_deref() != current_path {
+                last_thumbnail = latest_capture_thumbnail(&config.camera_dir, THUMBNAIL_SIZE);
+                thumbnail_dirty = true;
+            }
+            next_thumbnail_rescan = Instant::now() + Duration::from_millis(750);
         }
 
         let image_id = KITTY_IMAGE_IDS[(frame_serial as usize) % KITTY_IMAGE_IDS.len()];
         let z_index = (frame_serial % 1_000_000_000) as i32;
         write_kitty_rgb_frame(
             &mut out,
-            image_id,
-            KITTY_PLACEMENT_ID,
-            z_index,
-            previous_image_id,
-            config.width,
-            config.height,
-            area,
+            KittyFramePlacement {
+                image_id,
+                placement_id: KITTY_PLACEMENT_ID,
+                z_index,
+                previous_image_id,
+                width: config.width,
+                height: config.height,
+                area: layout.preview_area,
+            },
             &frame,
             &mut kitty_sequence,
         )?;
         previous_image_id = Some(image_id);
         frame_serial = frame_serial.wrapping_add(1);
+
+        if thumbnail_dirty {
+            if let (Some(thumbnail), Some(area)) = (&last_thumbnail, layout.thumbnail_area) {
+                let image_id = KITTY_THUMBNAIL_IMAGE_IDS
+                    [(thumbnail_serial as usize) % KITTY_THUMBNAIL_IMAGE_IDS.len()];
+                write_kitty_rgb_frame(
+                    &mut out,
+                    KittyFramePlacement {
+                        image_id,
+                        placement_id: KITTY_THUMBNAIL_PLACEMENT_ID,
+                        z_index: 1,
+                        previous_image_id: previous_thumbnail_image_id,
+                        width: THUMBNAIL_SIZE,
+                        height: THUMBNAIL_SIZE,
+                        area,
+                    },
+                    &thumbnail.frame,
+                    &mut kitty_sequence,
+                )?;
+                previous_thumbnail_image_id = Some(image_id);
+                thumbnail_serial = thumbnail_serial.wrapping_add(1);
+            } else if let Some(image_id) = previous_thumbnail_image_id.take() {
+                write_kitty_delete_image(&mut out, image_id)?;
+            }
+            thumbnail_dirty = false;
+        }
+
         out.flush()?;
     }
 
@@ -173,6 +296,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Config> {
             }
             "-f" | "--fps" => {
                 config.fps = parse_positive_arg(&arg, args.next())?;
+            }
+            "--camera-dir" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("{arg} requires a directory path"))?;
+                config.camera_dir = expand_home_path(&value);
             }
             "--force" => config.force = true,
             "--mirror-horizontal" => config.mirror_horizontal = true,
@@ -232,6 +361,7 @@ fn apply_config_text(config: &mut Config, text: &str) -> Result<()> {
             "mirror_horizontal" => {
                 config.mirror_horizontal = parse_config_bool(value, line_number, key)?;
             }
+            "camera_dir" => config.camera_dir = parse_config_path(value, line_number, key)?,
             "" => bail!("line {line_number}: empty config key"),
             _ => bail!("line {line_number}: unknown config key `{key}`"),
         }
@@ -252,6 +382,14 @@ fn parse_config_string(value: &str, line_number: usize, key: &str) -> Result<Str
     };
 
     Ok(body.to_string())
+}
+
+fn parse_config_path(value: &str, line_number: usize, key: &str) -> Result<PathBuf> {
+    Ok(expand_home_path(&parse_config_string(
+        value,
+        line_number,
+        key,
+    )?))
 }
 
 fn parse_config_u32(value: &str, line_number: usize, key: &str) -> Result<u32> {
@@ -278,6 +416,26 @@ fn config_path() -> Option<PathBuf> {
         .map(|dir| dir.join("lumi").join("config.toml"))
 }
 
+fn default_camera_dir() -> PathBuf {
+    env::var_os("HOME")
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|home| PathBuf::from(home).join("Pictures").join("Camera"))
+        .unwrap_or_else(|| PathBuf::from("Camera"))
+}
+
+fn expand_home_path(path: &str) -> PathBuf {
+    let home = env::var_os("HOME").filter(|home| !home.as_os_str().is_empty());
+    if path == "~" {
+        if let Some(home) = home {
+            return PathBuf::from(home);
+        }
+    } else if let (Some(rest), Some(home)) = (path.strip_prefix("~/"), home) {
+        return PathBuf::from(home).join(rest);
+    }
+
+    PathBuf::from(path)
+}
+
 fn parse_positive_arg(flag: &str, value: Option<String>) -> Result<u32> {
     let raw = value.ok_or_else(|| anyhow!("{flag} requires a value"))?;
     raw.parse::<u32>()
@@ -290,9 +448,10 @@ fn print_help() {
 lumi - live camera preview for Kitty-compatible terminals
 
 Usage:
-  lumi [--device /dev/video0] [--width 640] [--height 360] [--fps 30] [--mirror-horizontal] [--force]
+  lumi [--device /dev/video0] [--width 640] [--height 480] [--fps 30] [--camera-dir ~/Pictures/Camera] [--mirror-horizontal] [--force]
 
 Keys:
+  Space, Enter     take picture
   q, Esc, Ctrl-C   exit
 "
     );
@@ -306,6 +465,189 @@ fn frame_len(width: u32, height: u32) -> Result<usize> {
         .checked_mul(RAW_RGB_BYTES_PER_PIXEL as u32)
         .map(|v| v as usize)
         .ok_or_else(|| anyhow!("frame buffer is too large"))
+}
+
+fn save_capture(config: &Config, frame: &[u8]) -> Result<PathBuf> {
+    fs::create_dir_all(&config.camera_dir).with_context(|| {
+        format!(
+            "failed to create camera directory {}",
+            config.camera_dir.display()
+        )
+    })?;
+    let path = capture_path(&config.camera_dir)?;
+    let size = format!("{}x{}", config.width, config.height);
+
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-f",
+            "rawvideo",
+            "-pixel_format",
+            "rgb24",
+            "-video_size",
+            &size,
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            "-y",
+        ])
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start ffmpeg to save capture")?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to open ffmpeg capture input"))?;
+    stdin
+        .write_all(frame)
+        .context("failed to send capture frame to ffmpeg")?;
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .context("failed to finish capture encoding")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("failed to save capture: {}", stderr.trim());
+    }
+
+    Ok(path)
+}
+
+fn capture_path(camera_dir: &Path) -> Result<PathBuf> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?;
+    let stem = format!("capture-{}-{:09}", now.as_secs(), now.subsec_nanos());
+    Ok(camera_dir.join(format!("{stem}.jpg")))
+}
+
+fn latest_capture_thumbnail(camera_dir: &Path, size: u32) -> Option<CaptureThumbnail> {
+    let path = latest_image_path(camera_dir)?;
+    let frame = load_image_thumbnail(&path, size).ok()?;
+    Some(CaptureThumbnail { path, frame })
+}
+
+fn latest_image_path(camera_dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(camera_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| is_supported_capture_image(path))
+        .filter_map(|path| {
+            let modified = path
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()?;
+            Some((modified, path))
+        })
+        .max_by_key(|(modified, path)| (*modified, path.clone()))
+        .map(|(_, path)| path)
+}
+
+fn is_supported_capture_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "jpg" | "jpeg" | "png"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn load_image_thumbnail(path: &Path, size: u32) -> Result<Vec<u8>> {
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+        ])
+        .arg(path)
+        .args([
+            "-vf",
+            &format!(
+                "scale={size}:{size}:force_original_aspect_ratio=decrease,pad={size}:{size}:(ow-iw)/2:(oh-ih)/2:color=black,format=rgb24"
+            ),
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to load thumbnail from {}", path.display()))?;
+
+    if !output.status.success() {
+        bail!("ffmpeg could not decode {}", path.display());
+    }
+
+    let expected_len = frame_len(size, size)?;
+    if output.stdout.len() != expected_len {
+        bail!(
+            "thumbnail for {} has {} bytes, expected {expected_len}",
+            path.display(),
+            output.stdout.len()
+        );
+    }
+
+    Ok(output.stdout)
+}
+
+fn square_thumbnail(frame: &[u8], source_width: u32, source_height: u32, size: u32) -> Vec<u8> {
+    let output_len = frame_len(size, size).unwrap_or(0);
+    let mut out = vec![0_u8; output_len];
+    if source_width == 0 || source_height == 0 || size == 0 {
+        return out;
+    }
+
+    let (draw_width, draw_height) = if source_width >= source_height {
+        (
+            size,
+            (source_height.saturating_mul(size) / source_width).max(1),
+        )
+    } else {
+        (
+            (source_width.saturating_mul(size) / source_height).max(1),
+            size,
+        )
+    };
+    let x_offset = (size - draw_width) / 2;
+    let y_offset = (size - draw_height) / 2;
+
+    for y in 0..draw_height {
+        let src_y = y.saturating_mul(source_height) / draw_height;
+        let dst_y = y + y_offset;
+        for x in 0..draw_width {
+            let src_x = x.saturating_mul(source_width) / draw_width;
+            let dst_x = x + x_offset;
+            let src = ((src_y * source_width + src_x) * RAW_RGB_BYTES_PER_PIXEL as u32) as usize;
+            let dst = ((dst_y * size + dst_x) * RAW_RGB_BYTES_PER_PIXEL as u32) as usize;
+            if src + RAW_RGB_BYTES_PER_PIXEL <= frame.len()
+                && dst + RAW_RGB_BYTES_PER_PIXEL <= out.len()
+            {
+                out[dst..dst + RAW_RGB_BYTES_PER_PIXEL]
+                    .copy_from_slice(&frame[src..src + RAW_RGB_BYTES_PER_PIXEL]);
+            }
+        }
+    }
+
+    out
 }
 
 fn looks_like_kitty() -> bool {
@@ -435,8 +777,14 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("failed to enable raw terminal mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, Clear(ClearType::All), Hide)
-            .context("failed to enter terminal preview mode")?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            Clear(ClearType::All),
+            Hide,
+            EnableMouseCapture
+        )
+        .context("failed to enter terminal preview mode")?;
         Ok(Self)
     }
 }
@@ -445,13 +793,13 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
         let _ = write_kitty_apc_bytes(&mut stdout, clear_images_sequence().as_bytes());
-        let _ = execute!(stdout, Show, LeaveAlternateScreen);
+        let _ = execute!(stdout, DisableMouseCapture, Show, LeaveAlternateScreen);
         let _ = stdout.flush();
         let _ = disable_raw_mode();
     }
 }
 
-fn spawn_input_thread() -> mpsc::Receiver<()> {
+fn spawn_input_thread() -> mpsc::Receiver<InputEvent> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         loop {
@@ -462,12 +810,32 @@ fn spawn_input_thread() -> mpsc::Receiver<()> {
                         || (key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL)) =>
                 {
-                    let _ = tx.send(());
+                    let _ = tx.send(InputEvent::Quit);
                     break;
+                }
+                Ok(Event::Key(key))
+                    if key.code == KeyCode::Char(' ') || key.code == KeyCode::Enter =>
+                {
+                    if tx.send(InputEvent::Capture).is_err() {
+                        break;
+                    }
+                }
+                Ok(Event::Mouse(mouse))
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
+                {
+                    if tx
+                        .send(InputEvent::Click {
+                            x: mouse.column,
+                            y: mouse.row,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 Ok(_) => {}
                 Err(_) => {
-                    let _ = tx.send(());
+                    let _ = tx.send(InputEvent::Quit);
                     break;
                 }
             }
@@ -476,11 +844,84 @@ fn spawn_input_thread() -> mpsc::Receiver<()> {
     rx
 }
 
-fn image_area(source_width: u32, source_height: u32) -> ImageArea {
+fn drain_input_events(
+    rx: &mpsc::Receiver<InputEvent>,
+    layout: Option<UiLayout>,
+    capture_requested: &mut bool,
+) -> bool {
+    let mut should_quit = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            InputEvent::Quit => should_quit = true,
+            InputEvent::Capture => *capture_requested = true,
+            InputEvent::Click { x, y } => {
+                if layout
+                    .and_then(|layout| layout.capture_button)
+                    .is_some_and(|button| button.contains(x, y))
+                {
+                    *capture_requested = true;
+                }
+            }
+        }
+    }
+    should_quit
+}
+
+fn ui_layout(source_width: u32, source_height: u32) -> UiLayout {
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
     let (pixel_width, pixel_height) = terminal_pixel_size(cols, rows);
     let cell_width = f64::from(pixel_width) / f64::from(cols.max(1));
     let cell_height = f64::from(pixel_height) / f64::from(rows.max(1));
+    let sidebar_cols = if cols >= MIN_PREVIEW_COLS + MIN_SIDEBAR_COLS {
+        SIDEBAR_COLS.min(cols.saturating_sub(MIN_PREVIEW_COLS))
+    } else {
+        0
+    };
+    let preview_cols = cols.saturating_sub(sidebar_cols).max(1);
+    let sidebar = Rect {
+        x: preview_cols,
+        y: 0,
+        cols: sidebar_cols,
+        rows,
+    };
+    let preview_bounds = Rect {
+        x: 0,
+        y: 0,
+        cols: preview_cols,
+        rows,
+    };
+
+    let capture_button = (sidebar_cols > 0).then(|| Rect {
+        x: sidebar.x,
+        y: rows.saturating_sub(5) / 2,
+        cols: sidebar.cols,
+        rows: 5.min(rows.max(1)),
+    });
+    let thumbnail_area = thumbnail_area(sidebar, rows, cell_width, cell_height);
+
+    UiLayout {
+        preview_area: fit_image_area(
+            source_width,
+            source_height,
+            preview_bounds,
+            cell_width,
+            cell_height,
+        ),
+        sidebar,
+        capture_button,
+        thumbnail_area,
+    }
+}
+
+fn fit_image_area(
+    source_width: u32,
+    source_height: u32,
+    bounds: Rect,
+    cell_width: f64,
+    cell_height: f64,
+) -> ImageArea {
+    let cols = bounds.cols.max(1);
+    let rows = bounds.rows.max(1);
     let max_width_px = f64::from(cols) * cell_width;
     let max_height_px = f64::from(rows) * cell_height;
     let source_aspect = f64::from(source_width) / f64::from(source_height.max(1));
@@ -495,11 +936,33 @@ fn image_area(source_width: u32, source_height: u32) -> ImageArea {
     let display_rows = ((display_height_px / cell_height).floor() as u16).clamp(1, rows.max(1));
 
     ImageArea {
-        x: cols.saturating_sub(display_cols) / 2,
-        y: rows.saturating_sub(display_rows) / 2,
+        x: bounds.x + cols.saturating_sub(display_cols) / 2,
+        y: bounds.y + rows.saturating_sub(display_rows) / 2,
         cols: display_cols,
         rows: display_rows,
     }
+}
+
+fn thumbnail_area(
+    sidebar: Rect,
+    terminal_rows: u16,
+    cell_width: f64,
+    cell_height: f64,
+) -> Option<ImageArea> {
+    if sidebar.cols < 4 || terminal_rows < 4 {
+        return None;
+    }
+
+    let thumb_cols = sidebar.cols.saturating_sub(2).max(1);
+    let thumb_rows = ((f64::from(thumb_cols) * cell_width / cell_height).round() as u16)
+        .clamp(1, terminal_rows.saturating_sub(2).max(1));
+
+    Some(ImageArea {
+        x: sidebar.x + 1,
+        y: terminal_rows.saturating_sub(thumb_rows + 1),
+        cols: thumb_cols,
+        rows: thumb_rows,
+    })
 }
 
 fn terminal_pixel_size(cols: u16, rows: u16) -> (u32, u32) {
@@ -521,19 +984,88 @@ fn clear_screen_and_images(out: &mut impl Write) -> io::Result<()> {
     out.write_all(b"\x1b[2J\x1b[H")
 }
 
+fn draw_sidebar(out: &mut impl Write, layout: UiLayout) -> io::Result<()> {
+    if layout.sidebar.cols == 0 {
+        return Ok(());
+    }
+
+    if let Some(button) = layout.capture_button {
+        draw_capture_button(out, button)?;
+    }
+
+    if let Some(area) = layout.thumbnail_area {
+        draw_thumbnail_well(out, area)?;
+    }
+
+    out.write_all(b"\x1b[0m")
+}
+
+fn draw_capture_button(out: &mut impl Write, button: Rect) -> io::Result<()> {
+    let width = 9;
+    let inner_x = button.x.saturating_add(1);
+    let inner_cols = button.cols.saturating_sub(1);
+    let x = inner_x + inner_cols.saturating_sub(width) / 2;
+    let center_y = button.y + button.rows / 2;
+
+    write_at(out, x, center_y.saturating_sub(2), SIDEBAR_HOT, "╭───────╮")?;
+    write_at(out, x, center_y.saturating_sub(1), SIDEBAR_HOT, "│       │")?;
+    write_at(out, x, center_y, SIDEBAR_HOT, "│   ●   │")?;
+    write_at(out, x, center_y.saturating_add(1), SIDEBAR_HOT, "│       │")?;
+    write_at(out, x, center_y.saturating_add(2), SIDEBAR_HOT, "╰───────╯")
+}
+
+fn draw_thumbnail_well(out: &mut impl Write, area: ImageArea) -> io::Result<()> {
+    let frame = Rect {
+        x: area.x.saturating_sub(1),
+        y: area.y.saturating_sub(1),
+        cols: area.cols.saturating_add(2),
+        rows: area.rows.saturating_add(2),
+    };
+
+    let horizontal = "─".repeat(area.cols as usize);
+    write_at(
+        out,
+        frame.x,
+        frame.y,
+        SIDEBAR_DIM,
+        &format!("┌{horizontal}┐"),
+    )?;
+    for row in area.y..area.y.saturating_add(area.rows) {
+        write_at(out, frame.x, row, SIDEBAR_DIM, "│")?;
+        write_at(out, area.x + area.cols, row, SIDEBAR_DIM, "│")?;
+    }
+    write_at(
+        out,
+        frame.x,
+        area.y + area.rows,
+        SIDEBAR_DIM,
+        &format!("└{horizontal}┘"),
+    )
+}
+
+fn write_at(out: &mut impl Write, x: u16, y: u16, style: &str, text: &str) -> io::Result<()> {
+    write!(
+        out,
+        "\x1b[{};{}H{style}{text}",
+        y.saturating_add(1),
+        x.saturating_add(1)
+    )
+}
+
 fn clear_images_sequence() -> &'static str {
     "\x1b_Ga=d,d=A,q=2\x1b\\"
 }
 
+fn write_kitty_delete_image(out: &mut impl Write, image_id: u32) -> io::Result<()> {
+    write_kitty_apc_bytes(
+        out,
+        format!("\x1b_Ga=d,d=I,q=2,i={image_id}\x1b\\").as_bytes(),
+    )
+}
+
 fn write_kitty_rgb_frame(
     out: &mut impl Write,
-    image_id: u32,
-    placement_id: u32,
-    z_index: i32,
-    previous_image_id: Option<u32>,
-    width: u32,
-    height: u32,
-    area: ImageArea,
+    placement: KittyFramePlacement,
     frame: &[u8],
     sequence: &mut Vec<u8>,
 ) -> io::Result<()> {
@@ -541,8 +1073,8 @@ fn write_kitty_rgb_frame(
     write!(
         sequence,
         "\x1b[{};{}H",
-        area.y.saturating_add(1),
-        area.x.saturating_add(1)
+        placement.area.y.saturating_add(1),
+        placement.area.x.saturating_add(1)
     )?;
 
     let mut offset = 0;
@@ -553,13 +1085,18 @@ fn write_kitty_rgb_frame(
         let more = end < frame.len();
         let encoded_len = BASE64
             .encode_slice(&frame[offset..end], &mut encoded)
-            .map_err(|error| io::Error::new(ErrorKind::Other, error))?;
+            .map_err(io::Error::other)?;
         if first {
             write!(
                 sequence,
-                "\x1b_Ga=T,q=2,f=24,s={width},v={height},i={image_id},p={placement_id},c={},r={},C=1,z={z_index},m={};",
-                area.cols,
-                area.rows,
+                "\x1b_Ga=T,q=2,f=24,s={},v={},i={},p={},c={},r={},C=1,z={},m={};",
+                placement.width,
+                placement.height,
+                placement.image_id,
+                placement.placement_id,
+                placement.area.cols,
+                placement.area.rows,
+                placement.z_index,
                 if more { 1 } else { 0 },
             )?;
             sequence.extend_from_slice(&encoded[..encoded_len]);
@@ -572,8 +1109,8 @@ fn write_kitty_rgb_frame(
         }
         offset = end;
     }
-    if let Some(previous_image_id) = previous_image_id
-        && previous_image_id != image_id
+    if let Some(previous_image_id) = placement.previous_image_id
+        && previous_image_id != placement.image_id
     {
         write!(sequence, "\x1b_Ga=d,d=I,q=2,i={previous_image_id}\x1b\\")?;
     }
@@ -671,6 +1208,7 @@ mod tests {
                 width = 800
                 height = 450
                 fps = 60
+                camera_dir = "/tmp/camera"
             "#,
         )
         .expect("config file should parse");
@@ -679,6 +1217,7 @@ mod tests {
         assert_eq!(config.width, 800);
         assert_eq!(config.height, 450);
         assert_eq!(config.fps, 60);
+        assert_eq!(config.camera_dir, PathBuf::from("/tmp/camera"));
     }
 
     #[test]
@@ -702,6 +1241,47 @@ mod tests {
     }
 
     #[test]
+    fn square_thumbnail_returns_square_rgb_buffer() {
+        let frame = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255];
+
+        let thumbnail = square_thumbnail(&frame, 2, 2, 4);
+
+        assert_eq!(thumbnail.len(), 4 * 4 * RAW_RGB_BYTES_PER_PIXEL);
+    }
+
+    #[test]
+    fn latest_image_path_uses_newest_supported_image() {
+        let dir = env::temp_dir().join(format!(
+            "lumi-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("test dir should be created");
+
+        let old = dir.join("old.jpg");
+        let ignored = dir.join("newer.txt");
+        let new = dir.join("new.png");
+        fs::write(&old, b"old").expect("old image should be written");
+        thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&ignored, b"ignored").expect("ignored file should be written");
+        thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&new, b"new").expect("new image should be written");
+
+        assert_eq!(latest_image_path(&dir), Some(new));
+
+        fs::remove_dir_all(dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn latest_image_path_ignores_missing_directory() {
+        let path = env::temp_dir().join("lumi-definitely-missing-camera-dir");
+
+        assert_eq!(latest_image_path(&path), None);
+    }
+
+    #[test]
     fn kitty_frame_sequence_transmits_raw_rgb_at_requested_area() {
         let frame = [0, 0, 0, 255, 255, 255];
         let area = ImageArea {
@@ -713,8 +1293,21 @@ mod tests {
         let mut out = Vec::new();
         let mut scratch = Vec::new();
 
-        write_kitty_rgb_frame(&mut out, 7, 9, 11, None, 2, 1, area, &frame, &mut scratch)
-            .expect("kitty frame should encode");
+        write_kitty_rgb_frame(
+            &mut out,
+            KittyFramePlacement {
+                image_id: 7,
+                placement_id: 9,
+                z_index: 11,
+                previous_image_id: None,
+                width: 2,
+                height: 1,
+                area,
+            },
+            &frame,
+            &mut scratch,
+        )
+        .expect("kitty frame should encode");
 
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("\x1b[3;2H"));
@@ -735,13 +1328,15 @@ mod tests {
 
         write_kitty_rgb_frame(
             &mut out,
-            7,
-            9,
-            12,
-            None,
-            1025,
-            1,
-            area,
+            KittyFramePlacement {
+                image_id: 7,
+                placement_id: 9,
+                z_index: 12,
+                previous_image_id: None,
+                width: 1025,
+                height: 1,
+                area,
+            },
             &frame,
             &mut scratch,
         )
@@ -766,13 +1361,15 @@ mod tests {
 
         write_kitty_rgb_frame(
             &mut out,
-            8,
-            9,
-            13,
-            Some(7),
-            2,
-            1,
-            area,
+            KittyFramePlacement {
+                image_id: 8,
+                placement_id: 9,
+                z_index: 13,
+                previous_image_id: Some(7),
+                width: 2,
+                height: 1,
+                area,
+            },
             &frame,
             &mut scratch,
         )

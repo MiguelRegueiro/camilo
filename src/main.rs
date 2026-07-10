@@ -25,8 +25,8 @@ use crossterm::{
     },
 };
 
-const DEFAULT_WIDTH: u32 = 640;
-const DEFAULT_HEIGHT: u32 = 480;
+const DEFAULT_WIDTH: u32 = 1920;
+const DEFAULT_HEIGHT: u32 = 1080;
 const DEFAULT_FPS: u32 = 30;
 const DEFAULT_DEVICE: &str = "/dev/video0";
 const KITTY_IMAGE_ID: u32 = 0x4c_55_4d; // "LUM", within the 24-bit foreground-color-safe range.
@@ -40,7 +40,6 @@ const SIDEBAR_COLS: u16 = 16;
 const MIN_PREVIEW_COLS: u16 = 20;
 const MIN_SIDEBAR_COLS: u16 = 12;
 const THUMBNAIL_SIZE: u32 = 160;
-const SIDEBAR_DIM: &str = "\x1b[38;2;80;84;92m";
 const SIDEBAR_HOT: &str = "\x1b[38;2;245;245;246m";
 
 #[derive(Clone, Debug)]
@@ -448,7 +447,7 @@ fn print_help() {
 lumi - live camera preview for Kitty-compatible terminals
 
 Usage:
-  lumi [--device /dev/video0] [--width 640] [--height 480] [--fps 30] [--camera-dir ~/Pictures/Camera] [--mirror-horizontal] [--force]
+  lumi [--device /dev/video0] [--width 1920] [--height 1080] [--fps 30] [--camera-dir ~/Pictures/Camera] [--mirror-horizontal] [--force]
 
 Keys:
   Space, Enter     take picture
@@ -580,7 +579,7 @@ fn load_image_thumbnail(path: &Path, size: u32) -> Result<Vec<u8>> {
         .args([
             "-vf",
             &format!(
-                "scale={size}:{size}:force_original_aspect_ratio=decrease,pad={size}:{size}:(ow-iw)/2:(oh-ih)/2:color=black,format=rgb24"
+                "scale={size}:{size}:force_original_aspect_ratio=increase,crop={size}:{size}:(iw-ow)/2:(ih-oh)/2,format=rgb24"
             ),
             "-frames:v",
             "1",
@@ -616,28 +615,16 @@ fn square_thumbnail(frame: &[u8], source_width: u32, source_height: u32, size: u
         return out;
     }
 
-    let (draw_width, draw_height) = if source_width >= source_height {
-        (
-            size,
-            (source_height.saturating_mul(size) / source_width).max(1),
-        )
-    } else {
-        (
-            (source_width.saturating_mul(size) / source_height).max(1),
-            size,
-        )
-    };
-    let x_offset = (size - draw_width) / 2;
-    let y_offset = (size - draw_height) / 2;
+    let crop_size = source_width.min(source_height).max(1);
+    let crop_x = (source_width - crop_size) / 2;
+    let crop_y = (source_height - crop_size) / 2;
 
-    for y in 0..draw_height {
-        let src_y = y.saturating_mul(source_height) / draw_height;
-        let dst_y = y + y_offset;
-        for x in 0..draw_width {
-            let src_x = x.saturating_mul(source_width) / draw_width;
-            let dst_x = x + x_offset;
+    for y in 0..size {
+        let src_y = crop_y + y.saturating_mul(crop_size) / size;
+        for x in 0..size {
+            let src_x = crop_x + x.saturating_mul(crop_size) / size;
             let src = ((src_y * source_width + src_x) * RAW_RGB_BYTES_PER_PIXEL as u32) as usize;
-            let dst = ((dst_y * size + dst_x) * RAW_RGB_BYTES_PER_PIXEL as u32) as usize;
+            let dst = ((y * size + x) * RAW_RGB_BYTES_PER_PIXEL as u32) as usize;
             if src + RAW_RGB_BYTES_PER_PIXEL <= frame.len()
                 && dst + RAW_RGB_BYTES_PER_PIXEL <= out.len()
             {
@@ -670,6 +657,8 @@ struct CameraStream {
 impl CameraStream {
     fn spawn(config: &Config) -> Result<Self> {
         let video_filter = ffmpeg_video_filter(config);
+        let input_size = format!("{}x{}", config.width, config.height);
+        let framerate = config.fps.to_string();
 
         let mut child = Command::new("ffmpeg")
             .args([
@@ -683,6 +672,10 @@ impl CameraStream {
                 "low_delay",
                 "-f",
                 "v4l2",
+                "-framerate",
+                &framerate,
+                "-video_size",
+                &input_size,
                 "-i",
                 &config.device,
                 "-an",
@@ -766,7 +759,7 @@ fn ffmpeg_video_filter(config: &Config) -> String {
         ""
     };
     format!(
-        "{mirror}scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2:color=black,fps={},format=rgb24",
+        "{mirror}scale={}:{}:force_original_aspect_ratio=increase,crop={}:{}:(iw-ow)/2:(ih-oh)/2,fps={},format=rgb24",
         config.width, config.height, config.width, config.height, config.fps
     )
 }
@@ -993,10 +986,6 @@ fn draw_sidebar(out: &mut impl Write, layout: UiLayout) -> io::Result<()> {
         draw_capture_button(out, button)?;
     }
 
-    if let Some(area) = layout.thumbnail_area {
-        draw_thumbnail_well(out, area)?;
-    }
-
     out.write_all(b"\x1b[0m")
 }
 
@@ -1012,35 +1001,6 @@ fn draw_capture_button(out: &mut impl Write, button: Rect) -> io::Result<()> {
     write_at(out, x, center_y, SIDEBAR_HOT, "│   ●   │")?;
     write_at(out, x, center_y.saturating_add(1), SIDEBAR_HOT, "│       │")?;
     write_at(out, x, center_y.saturating_add(2), SIDEBAR_HOT, "╰───────╯")
-}
-
-fn draw_thumbnail_well(out: &mut impl Write, area: ImageArea) -> io::Result<()> {
-    let frame = Rect {
-        x: area.x.saturating_sub(1),
-        y: area.y.saturating_sub(1),
-        cols: area.cols.saturating_add(2),
-        rows: area.rows.saturating_add(2),
-    };
-
-    let horizontal = "─".repeat(area.cols as usize);
-    write_at(
-        out,
-        frame.x,
-        frame.y,
-        SIDEBAR_DIM,
-        &format!("┌{horizontal}┐"),
-    )?;
-    for row in area.y..area.y.saturating_add(area.rows) {
-        write_at(out, frame.x, row, SIDEBAR_DIM, "│")?;
-        write_at(out, area.x + area.cols, row, SIDEBAR_DIM, "│")?;
-    }
-    write_at(
-        out,
-        frame.x,
-        area.y + area.rows,
-        SIDEBAR_DIM,
-        &format!("└{horizontal}┘"),
-    )
 }
 
 fn write_at(out: &mut impl Write, x: u16, y: u16, style: &str, text: &str) -> io::Result<()> {
@@ -1237,7 +1197,9 @@ mod tests {
         assert!(!ffmpeg_video_filter(&config).starts_with("hflip,"));
 
         config.mirror_horizontal = true;
-        assert!(ffmpeg_video_filter(&config).starts_with("hflip,scale="));
+        let filter = ffmpeg_video_filter(&config);
+        assert!(filter.starts_with("hflip,scale="));
+        assert!(filter.contains("force_original_aspect_ratio=increase,crop="));
     }
 
     #[test]
@@ -1247,6 +1209,15 @@ mod tests {
         let thumbnail = square_thumbnail(&frame, 2, 2, 4);
 
         assert_eq!(thumbnail.len(), 4 * 4 * RAW_RGB_BYTES_PER_PIXEL);
+    }
+
+    #[test]
+    fn square_thumbnail_crops_instead_of_letterboxing() {
+        let frame = vec![255; 4 * 2 * RAW_RGB_BYTES_PER_PIXEL];
+
+        let thumbnail = square_thumbnail(&frame, 4, 2, 4);
+
+        assert!(thumbnail.iter().all(|&byte| byte == 255));
     }
 
     #[test]

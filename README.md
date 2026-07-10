@@ -18,7 +18,7 @@ cargo run --release
 Useful options:
 
 ```sh
-cargo run --release -- --device /dev/video0 --width 640 --height 480 --fps 30
+cargo run --release -- --device /dev/video0 --width 1920 --height 1080 --fps 30
 ```
 
 Optional config:
@@ -28,8 +28,8 @@ Optional config:
 mirror_horizontal = true
 camera_dir = "~/Pictures/Camera"
 # device = "/dev/video0"
-# width = 640
-# height = 480
+# width = 1920
+# height = 1080
 # fps = 30
 ```
 

@@ -1,7 +1,9 @@
 use std::{
     env,
     ffi::OsStr,
+    fs,
     io::{self, BufWriter, ErrorKind, Read, Write},
+    path::PathBuf,
     process::{Child, ChildStdout, Command, Stdio},
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -36,6 +38,7 @@ struct Config {
     height: u32,
     fps: u32,
     force: bool,
+    mirror_horizontal: bool,
 }
 
 impl Default for Config {
@@ -46,6 +49,7 @@ impl Default for Config {
             height: DEFAULT_HEIGHT,
             fps: DEFAULT_FPS,
             force: false,
+            mirror_horizontal: false,
         }
     }
 }
@@ -144,8 +148,15 @@ fn run() -> Result<()> {
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Config> {
+    let args = args.collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--help") {
+        print_help();
+        std::process::exit(0);
+    }
+
     let mut config = Config::default();
-    let mut args = args.peekable();
+    load_config_file(&mut config)?;
+    let mut args = args.into_iter().peekable();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -164,10 +175,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Config> {
                 config.fps = parse_positive_arg(&arg, args.next())?;
             }
             "--force" => config.force = true,
-            "--help" => {
-                print_help();
-                std::process::exit(0);
-            }
+            "--mirror-horizontal" => config.mirror_horizontal = true,
             _ => bail!("unknown argument: {arg}"),
         }
     }
@@ -182,6 +190,94 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Config> {
     Ok(config)
 }
 
+fn load_config_file(config: &mut Config) -> Result<()> {
+    let Some(path) = config_path() else {
+        return Ok(());
+    };
+
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read config file {}", path.display()));
+        }
+    };
+
+    apply_config_text(config, &text)
+        .with_context(|| format!("failed to parse config file {}", path.display()))?;
+    Ok(())
+}
+
+fn apply_config_text(config: &mut Config, text: &str) -> Result<()> {
+    for (index, raw_line) in text.lines().enumerate() {
+        let line_number = index + 1;
+        let line = strip_config_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| anyhow!("line {line_number}: expected `key = value`"))?;
+        let key = key.trim();
+        let value = value.trim();
+
+        match key {
+            "device" => config.device = parse_config_string(value, line_number, key)?,
+            "width" => config.width = parse_config_u32(value, line_number, key)?,
+            "height" => config.height = parse_config_u32(value, line_number, key)?,
+            "fps" => config.fps = parse_config_u32(value, line_number, key)?,
+            "force" => config.force = parse_config_bool(value, line_number, key)?,
+            "mirror_horizontal" => {
+                config.mirror_horizontal = parse_config_bool(value, line_number, key)?;
+            }
+            "" => bail!("line {line_number}: empty config key"),
+            _ => bail!("line {line_number}: unknown config key `{key}`"),
+        }
+    }
+    Ok(())
+}
+
+fn strip_config_comment(line: &str) -> &str {
+    line.split_once('#').map_or(line, |(value, _)| value)
+}
+
+fn parse_config_string(value: &str, line_number: usize, key: &str) -> Result<String> {
+    let Some(body) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        bail!("line {line_number}: `{key}` expects a quoted string");
+    };
+
+    Ok(body.to_string())
+}
+
+fn parse_config_u32(value: &str, line_number: usize, key: &str) -> Result<u32> {
+    value
+        .parse::<u32>()
+        .with_context(|| format!("line {line_number}: `{key}` expects a positive integer"))
+}
+
+fn parse_config_bool(value: &str, line_number: usize, key: &str) -> Result<bool> {
+    value
+        .parse::<bool>()
+        .with_context(|| format!("line {line_number}: `{key}` expects true or false"))
+}
+
+fn config_path() -> Option<PathBuf> {
+    env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME")
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|home| PathBuf::from(home).join(".config"))
+        })
+        .map(|dir| dir.join("lumi").join("config.toml"))
+}
+
 fn parse_positive_arg(flag: &str, value: Option<String>) -> Result<u32> {
     let raw = value.ok_or_else(|| anyhow!("{flag} requires a value"))?;
     raw.parse::<u32>()
@@ -194,7 +290,7 @@ fn print_help() {
 lumi - live camera preview for Kitty-compatible terminals
 
 Usage:
-  lumi [--device /dev/video0] [--width 640] [--height 360] [--fps 30] [--force]
+  lumi [--device /dev/video0] [--width 640] [--height 360] [--fps 30] [--mirror-horizontal] [--force]
 
 Keys:
   q, Esc, Ctrl-C   exit
@@ -231,10 +327,7 @@ struct CameraStream {
 
 impl CameraStream {
     fn spawn(config: &Config) -> Result<Self> {
-        let scale = format!(
-            "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2:color=black,fps={},format=rgb24",
-            config.width, config.height, config.width, config.height, config.fps
-        );
+        let video_filter = ffmpeg_video_filter(config);
 
         let mut child = Command::new("ffmpeg")
             .args([
@@ -254,7 +347,7 @@ impl CameraStream {
                 "-sn",
                 "-dn",
                 "-vf",
-                &scale,
+                &video_filter,
                 "-pix_fmt",
                 "rgb24",
                 "-f",
@@ -324,6 +417,18 @@ impl Drop for CameraStream {
     }
 }
 
+fn ffmpeg_video_filter(config: &Config) -> String {
+    let mirror = if config.mirror_horizontal {
+        "hflip,"
+    } else {
+        ""
+    };
+    format!(
+        "{mirror}scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2:color=black,fps={},format=rgb24",
+        config.width, config.height, config.width, config.height, config.fps
+    )
+}
+
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -339,7 +444,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        let _ = stdout.write_all(clear_images_sequence().as_bytes());
+        let _ = write_kitty_apc_bytes(&mut stdout, clear_images_sequence().as_bytes());
         let _ = execute!(stdout, Show, LeaveAlternateScreen);
         let _ = stdout.flush();
         let _ = disable_raw_mode();
@@ -412,7 +517,7 @@ fn terminal_pixel_size(cols: u16, rows: u16) -> (u32, u32) {
 }
 
 fn clear_screen_and_images(out: &mut impl Write) -> io::Result<()> {
-    out.write_all(clear_images_sequence().as_bytes())?;
+    write_kitty_apc_bytes(out, clear_images_sequence().as_bytes())?;
     out.write_all(b"\x1b[2J\x1b[H")
 }
 
@@ -473,6 +578,10 @@ fn write_kitty_rgb_frame(
         write!(sequence, "\x1b_Ga=d,d=I,q=2,i={previous_image_id}\x1b\\")?;
     }
 
+    write_kitty_apc_bytes(out, sequence)
+}
+
+fn write_kitty_apc_bytes(out: &mut impl Write, sequence: &[u8]) -> io::Result<()> {
     if inside_tmux() {
         out.write_all(&wrap_kitty_apcs_for_tmux(sequence))
     } else {
@@ -538,6 +647,59 @@ fn wrap_sequence_for_tmux(sequence: &[u8], out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_file_applies_horizontal_mirror() {
+        let mut config = Config::default();
+
+        apply_config_text(&mut config, "mirror_horizontal = true\n")
+            .expect("config file should parse");
+
+        assert!(config.mirror_horizontal);
+        assert_eq!(config.device, DEFAULT_DEVICE);
+    }
+
+    #[test]
+    fn config_file_parses_comments_strings_and_numbers() {
+        let mut config = Config::default();
+
+        apply_config_text(
+            &mut config,
+            r#"
+                # camera settings
+                device = "/dev/video1" # inline comment
+                width = 800
+                height = 450
+                fps = 60
+            "#,
+        )
+        .expect("config file should parse");
+
+        assert_eq!(config.device, "/dev/video1");
+        assert_eq!(config.width, 800);
+        assert_eq!(config.height, 450);
+        assert_eq!(config.fps, 60);
+    }
+
+    #[test]
+    fn config_file_rejects_unknown_keys() {
+        let mut config = Config::default();
+
+        let error = apply_config_text(&mut config, "unknown = true\n")
+            .expect_err("unknown key should fail");
+
+        assert!(error.to_string().contains("unknown config key"));
+    }
+
+    #[test]
+    fn ffmpeg_filter_adds_hflip_when_horizontal_mirror_is_enabled() {
+        let mut config = Config::default();
+
+        assert!(!ffmpeg_video_filter(&config).starts_with("hflip,"));
+
+        config.mirror_horizontal = true;
+        assert!(ffmpeg_video_filter(&config).starts_with("hflip,scale="));
+    }
 
     #[test]
     fn kitty_frame_sequence_transmits_raw_rgb_at_requested_area() {

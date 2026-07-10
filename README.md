@@ -7,7 +7,7 @@ This first build is intentionally small:
 - Rust app
 - `ffmpeg` camera backend
 - Kitty graphics protocol
-- no UI, no capture, no config file
+- no UI, no capture
 
 Run:
 
@@ -19,6 +19,23 @@ Useful options:
 
 ```sh
 cargo run --release -- --device /dev/video0 --width 640 --height 360 --fps 30
+```
+
+Optional config:
+
+```toml
+# ~/.config/lumi/config.toml
+mirror_horizontal = true
+# device = "/dev/video0"
+# width = 640
+# height = 360
+# fps = 30
+```
+
+To mirror only for one run:
+
+```sh
+cargo run --release -- --mirror-horizontal
 ```
 
 Keys:

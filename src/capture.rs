@@ -623,7 +623,7 @@ mod tests {
     #[test]
     fn video_path_uses_mp4_extension() {
         let path =
-            video_path(Path::new("/tmp/lumi-camera")).expect("video path should be generated");
+            video_path(Path::new("/tmp/camilo-camera")).expect("video path should be generated");
 
         assert_eq!(path.extension().and_then(OsStr::to_str), Some("mp4"));
     }
@@ -631,7 +631,7 @@ mod tests {
     #[test]
     fn latest_image_path_uses_newest_supported_image() {
         let dir = env::temp_dir().join(format!(
-            "lumi-test-{}",
+            "camilo-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock should be valid")
@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn latest_image_path_ignores_missing_directory() {
-        let path = env::temp_dir().join("lumi-definitely-missing-camera-dir");
+        let path = env::temp_dir().join("camilo-definitely-missing-camera-dir");
 
         assert_eq!(latest_image_path(&path), None);
     }

@@ -65,14 +65,15 @@ fn parse_positive_arg(flag: &str, value: Option<String>) -> Result<u32> {
 fn print_help() {
     println!(
         "\
-lumi - live camera preview for Kitty-compatible terminals
+camilo - live camera preview for Kitty-compatible terminals
 
 Usage:
-  lumi [--device /dev/video0] [--width 1920] [--height 1080] [--fps 30] [--camera-dir ~/Pictures/Camera] [--mirror-horizontal] [--force]
+  camilo [--device /dev/video0] [--width 1920] [--height 1080] [--fps 30] [--camera-dir ~/Pictures/Camera] [--mirror-horizontal] [--force]
 
-Keys:
-  Space, Enter     take picture
-  q, Esc, Ctrl-C   exit
+Controls:
+  Right-side shutter button  take pictures or start/stop video recording
+  Right-side mode switch     toggle photo/video mode
+  q, Esc, Ctrl-C             exit
 "
     );
 }

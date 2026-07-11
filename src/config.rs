@@ -136,7 +136,7 @@ fn config_path() -> Option<PathBuf> {
                 .filter(|path| !path.as_os_str().is_empty())
                 .map(|home| PathBuf::from(home).join(".config"))
         })
-        .map(|dir| dir.join("lumi").join("config.toml"))
+        .map(|dir| dir.join("camilo").join("config.toml"))
 }
 
 fn default_camera_dir() -> PathBuf {

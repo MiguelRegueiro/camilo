@@ -1,4 +1,4 @@
-# lumi
+# camilo
 
 Live camera preview for Kitty-compatible terminals.
 
@@ -24,7 +24,7 @@ cargo run --release -- --device /dev/video0 --width 1920 --height 1080 --fps 30
 Optional config:
 
 ```toml
-# ~/.config/lumi/config.toml
+# ~/.config/camilo/config.toml
 mirror_horizontal = true
 camera_dir = "~/Pictures/Camera"
 # device = "/dev/video0"
@@ -39,9 +39,10 @@ To mirror only for one run:
 cargo run --release -- --mirror-horizontal
 ```
 
-Keys:
+Controls:
 
-- `Space`, `Enter`, or the right-side shutter button takes a picture.
+- Use the right-side shutter button to take pictures or start/stop video recording.
+- Use the right-side mode switch to toggle photo/video mode.
 - `q`, `Esc`, or `Ctrl-C` exits.
 
 Linux and FreeBSD both use the `v4l2` ffmpeg input in this prototype. On

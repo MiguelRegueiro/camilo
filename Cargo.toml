@@ -1,9 +1,9 @@
 [package]
-name = "lumi"
+name = "camilo"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
-description = "Live camera preview in Kitty-compatible terminals"
+description = "Terminal camera app for Kitty-compatible terminals"
 license = "MIT"
 
 [dependencies]

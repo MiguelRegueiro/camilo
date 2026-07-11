@@ -6,7 +6,7 @@ mod terminal;
 
 fn main() {
     if let Err(error) = app::run() {
-        eprintln!("lumi: {error:#}");
+        eprintln!("camilo: {error:#}");
         std::process::exit(1);
     }
 }

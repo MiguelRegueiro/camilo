@@ -16,6 +16,100 @@ use crate::config::Config;
 pub(crate) const RAW_RGB_BYTES_PER_PIXEL: usize = 3;
 pub(crate) const THUMBNAIL_SIZE: u32 = 160;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CameraMode {
+    pub(crate) format: String,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) fps: u32,
+}
+
+pub(crate) fn apply_best_camera_mode(config: &mut Config) {
+    if let Ok(mode) = best_camera_mode(&config.device) {
+        config.input_format = Some(ffmpeg_input_format(&mode.format).to_string());
+        config.width = mode.width;
+        config.height = mode.height;
+        config.fps = mode.fps;
+    }
+}
+
+fn best_camera_mode(device: &str) -> Result<CameraMode> {
+    let output = Command::new("v4l2-ctl")
+        .arg(format!("--device={device}"))
+        .arg("--list-formats-ext")
+        .output()
+        .context("failed to query camera formats with v4l2-ctl")?;
+    if !output.status.success() {
+        bail!("v4l2-ctl failed to query camera formats");
+    }
+    parse_best_camera_mode(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| anyhow!("camera did not report usable capture modes"))
+}
+
+fn parse_best_camera_mode(text: &str) -> Option<CameraMode> {
+    let mut format = None::<String>;
+    let mut size = None::<(u32, u32)>;
+    let mut modes = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            format = trimmed.split('\'').nth(1).map(str::to_string);
+            size = None;
+        } else if let Some(raw_size) = trimmed.strip_prefix("Size: Discrete ") {
+            size = raw_size
+                .split_once('x')
+                .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)));
+        } else if let Some(interval) = trimmed.strip_prefix("Interval: Discrete ") {
+            let fps = parse_interval_fps(interval)?;
+            let (width, height) = size?;
+            let format = format.clone()?;
+            modes.push(CameraMode {
+                format,
+                width,
+                height,
+                fps,
+            });
+        }
+    }
+
+    modes.into_iter().max_by_key(|mode| {
+        (
+            mode.width as u64 * mode.height as u64,
+            mode.fps,
+            u8::from(mode.format == "MJPG"),
+        )
+    })
+}
+
+fn parse_interval_fps(interval: &str) -> Option<u32> {
+    let fps = interval
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(" fps)"))
+        .and_then(|(value, _)| value.parse::<f64>().ok())
+        .or_else(|| {
+            let (seconds, _) = interval.split_once('s')?;
+            let seconds = seconds.parse::<f64>().ok()?;
+            (seconds > 0.0).then_some(1.0 / seconds)
+        })?;
+    Some(fps.round().clamp(1.0, 120.0) as u32)
+}
+
+fn ffmpeg_input_format(format: &str) -> &str {
+    match format {
+        "MJPG" => "mjpeg",
+        "YUYV" => "yuyv422",
+        other => other,
+    }
+}
+
+fn add_input_format_args(args: &mut Vec<String>, config: &Config) {
+    if let Some(input_format) = &config.input_format {
+        args.push("-input_format".to_string());
+        args.push(input_format.clone());
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CaptureThumbnail {
     pub(crate) path: PathBuf,
@@ -128,7 +222,9 @@ impl VideoRecording {
                 "-c:v",
                 "libx264",
                 "-preset",
-                "ultrafast",
+                "veryfast",
+                "-crf",
+                "18",
                 "-pix_fmt",
                 "yuv420p",
                 "-movflags",
@@ -361,35 +457,40 @@ impl CameraStream {
         let input_size = format!("{}x{}", config.width, config.height);
         let framerate = config.fps.to_string();
 
+        let mut args = vec![
+            "-hide_banner".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-nostdin".to_string(),
+            "-fflags".to_string(),
+            "nobuffer".to_string(),
+            "-flags".to_string(),
+            "low_delay".to_string(),
+            "-f".to_string(),
+            "v4l2".to_string(),
+        ];
+        add_input_format_args(&mut args, config);
+        args.extend([
+            "-framerate".to_string(),
+            framerate,
+            "-video_size".to_string(),
+            input_size,
+            "-i".to_string(),
+            config.device.clone(),
+            "-an".to_string(),
+            "-sn".to_string(),
+            "-dn".to_string(),
+            "-vf".to_string(),
+            video_filter,
+            "-pix_fmt".to_string(),
+            "rgb24".to_string(),
+            "-f".to_string(),
+            "rawvideo".to_string(),
+            "pipe:1".to_string(),
+        ]);
+
         let mut child = Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-fflags",
-                "nobuffer",
-                "-flags",
-                "low_delay",
-                "-f",
-                "v4l2",
-                "-framerate",
-                &framerate,
-                "-video_size",
-                &input_size,
-                "-i",
-                &config.device,
-                "-an",
-                "-sn",
-                "-dn",
-                "-vf",
-                &video_filter,
-                "-pix_fmt",
-                "rgb24",
-                "-f",
-                "rawvideo",
-                "pipe:1",
-            ])
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -472,6 +573,33 @@ mod tests {
         let filter = ffmpeg_video_filter(&config);
         assert!(filter.starts_with("hflip,scale="));
         assert!(filter.contains("force_original_aspect_ratio=increase,crop="));
+    }
+
+    #[test]
+    fn best_camera_mode_prefers_largest_mjpg_mode() {
+        let output = r#"
+            ioctl: VIDIOC_ENUM_FMT
+                Type: Video Capture
+
+                [0]: 'MJPG' (Motion-JPEG, compressed)
+                    Size: Discrete 1920x1080
+                        Interval: Discrete 0.033s (30.000 fps)
+                    Size: Discrete 1280x960
+                        Interval: Discrete 0.033s (30.000 fps)
+                [1]: 'YUYV' (YUYV 4:2:2)
+                    Size: Discrete 640x480
+                        Interval: Discrete 0.033s (30.000 fps)
+        "#;
+
+        assert_eq!(
+            parse_best_camera_mode(output),
+            Some(CameraMode {
+                format: "MJPG".to_string(),
+                width: 1920,
+                height: 1080,
+                fps: 30,
+            })
+        );
     }
 
     #[test]

@@ -7,8 +7,8 @@ use anyhow::{Result, bail};
 
 use crate::{
     capture::{
-        CameraStream, CaptureThumbnail, THUMBNAIL_SIZE, VideoRecording, frame_len,
-        latest_capture_thumbnail, latest_image_path, save_capture, square_thumbnail,
+        CameraStream, CaptureThumbnail, THUMBNAIL_SIZE, VideoRecording, apply_best_camera_mode,
+        frame_len, latest_capture_thumbnail, latest_image_path, save_capture, square_thumbnail,
     },
     cli,
     terminal::{
@@ -28,7 +28,8 @@ struct ActiveRecording {
 }
 
 pub(crate) fn run() -> Result<()> {
-    let config = cli::config_from_env()?;
+    let mut config = cli::config_from_env()?;
+    apply_best_camera_mode(&mut config);
 
     if !config.force && !looks_like_kitty() {
         bail!(

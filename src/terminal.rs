@@ -27,10 +27,12 @@ pub(crate) const KITTY_IMAGE_IDS: [u32; 2] = [KITTY_IMAGE_ID, KITTY_IMAGE_ID + 1
 pub(crate) const KITTY_THUMBNAIL_IMAGE_IDS: [u32; 2] = [KITTY_IMAGE_ID + 10, KITTY_IMAGE_ID + 11];
 pub(crate) const KITTY_SHUTTER_IMAGE_ID: u32 = KITTY_IMAGE_ID + 20;
 pub(crate) const KITTY_MODE_IMAGE_ID: u32 = KITTY_IMAGE_ID + 30;
+pub(crate) const KITTY_TIMER_IMAGE_ID: u32 = KITTY_IMAGE_ID + 40;
 pub(crate) const KITTY_PLACEMENT_ID: u32 = 1;
 pub(crate) const KITTY_THUMBNAIL_PLACEMENT_ID: u32 = 2;
 pub(crate) const KITTY_SHUTTER_PLACEMENT_ID: u32 = 3;
 pub(crate) const KITTY_MODE_PLACEMENT_ID: u32 = 4;
+pub(crate) const KITTY_TIMER_PLACEMENT_ID: u32 = 5;
 const KITTY_RAW_CHUNK_BYTES: usize = 3 * 4096 / 4;
 const SIDEBAR_COLS: u16 = 16;
 const MIN_PREVIEW_COLS: u16 = 20;
@@ -38,8 +40,11 @@ const MIN_SIDEBAR_COLS: u16 = 12;
 const SHUTTER_SIZE: u32 = 128;
 const MODE_PILL_WIDTH: u32 = 128;
 const MODE_PILL_HEIGHT: u32 = 160;
+const RECORDING_TIMER_WIDTH: u32 = 224;
+const RECORDING_TIMER_HEIGHT: u32 = 48;
 const SHUTTER_Z_INDEX: i32 = 1_000_000_001;
 const MODE_PILL_Z_INDEX: i32 = 1_000_000_002;
+const TIMER_Z_INDEX: i32 = 1_000_000_003;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Rect {
@@ -74,6 +79,7 @@ pub(crate) struct UiLayout {
     pub(crate) shutter_area: Option<ImageArea>,
     pub(crate) mode_toggle: Option<Rect>,
     pub(crate) mode_pill_area: Option<ImageArea>,
+    pub(crate) recording_timer_area: Option<ImageArea>,
     pub(crate) thumbnail_area: Option<ImageArea>,
 }
 
@@ -106,8 +112,6 @@ impl CaptureMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputEvent {
     Quit,
-    Capture,
-    ToggleMode,
     Click { x: u16, y: u16 },
 }
 
@@ -163,18 +167,6 @@ pub(crate) fn spawn_input_thread() -> mpsc::Receiver<InputEvent> {
                     let _ = tx.send(InputEvent::Quit);
                     break;
                 }
-                Ok(Event::Key(key))
-                    if key.code == KeyCode::Char(' ') || key.code == KeyCode::Enter =>
-                {
-                    if tx.send(InputEvent::Capture).is_err() {
-                        break;
-                    }
-                }
-                Ok(Event::Key(key)) if key.code == KeyCode::Char('v') => {
-                    if tx.send(InputEvent::ToggleMode).is_err() {
-                        break;
-                    }
-                }
                 Ok(Event::Mouse(mouse))
                     if mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
                 {
@@ -203,6 +195,7 @@ pub(crate) fn drain_input_events(
     rx: &mpsc::Receiver<InputEvent>,
     layout: Option<UiLayout>,
     capture_mode: &mut CaptureMode,
+    mode_locked: bool,
     capture_requested: &mut bool,
     chrome_dirty: &mut bool,
 ) -> bool {
@@ -210,20 +203,16 @@ pub(crate) fn drain_input_events(
     while let Ok(event) = rx.try_recv() {
         match event {
             InputEvent::Quit => should_quit = true,
-            InputEvent::Capture => *capture_requested = true,
-            InputEvent::ToggleMode => {
-                capture_mode.toggle();
-                *chrome_dirty = true;
-            }
             InputEvent::Click { x, y } => {
                 if layout
                     .and_then(|layout| layout.capture_button)
                     .is_some_and(|button| button.contains(x, y))
                 {
                     *capture_requested = true;
-                } else if layout
-                    .and_then(|layout| layout.mode_toggle)
-                    .is_some_and(|toggle| toggle.contains(x, y))
+                } else if !mode_locked
+                    && layout
+                        .and_then(|layout| layout.mode_toggle)
+                        .is_some_and(|toggle| toggle.contains(x, y))
                 {
                     capture_mode.toggle();
                     *chrome_dirty = true;
@@ -267,6 +256,7 @@ pub(crate) fn ui_layout(source_width: u32, source_height: u32) -> UiLayout {
     let shutter_area = shutter_slot.and_then(|slot| shutter_area(slot, cell_width, cell_height));
     let capture_button = shutter_area.map(capture_hitbox);
     let (mode_toggle, mode_pill_area) = mode_pill_area(sidebar);
+    let recording_timer_area = recording_timer_area(preview_bounds);
     let thumbnail_area = thumbnail_area(sidebar, rows, cell_width, cell_height);
 
     UiLayout {
@@ -282,6 +272,7 @@ pub(crate) fn ui_layout(source_width: u32, source_height: u32) -> UiLayout {
         shutter_area,
         mode_toggle,
         mode_pill_area,
+        recording_timer_area,
         thumbnail_area,
     }
 }
@@ -336,6 +327,27 @@ fn mode_pill_area(sidebar: Rect) -> (Option<Rect>, Option<ImageArea>) {
     };
 
     (Some(rect), Some(area))
+}
+
+fn recording_timer_area(preview: Rect) -> Option<ImageArea> {
+    if preview.cols < 12 || preview.rows < 4 {
+        return None;
+    }
+
+    let cols = 16.min(preview.cols.saturating_sub(2));
+    let rect = Rect {
+        x: preview.x + preview.cols.saturating_sub(cols) / 2,
+        y: preview.y + 1,
+        cols,
+        rows: 3,
+    };
+
+    Some(ImageArea {
+        x: rect.x,
+        y: rect.y,
+        cols: rect.cols,
+        rows: rect.rows,
+    })
 }
 
 fn thumbnail_area(
@@ -439,9 +451,10 @@ pub(crate) fn write_kitty_shutter_button(
     out: &mut impl Write,
     area: ImageArea,
     capture_mode: CaptureMode,
+    recording: bool,
     sequence: &mut Vec<u8>,
 ) -> io::Result<()> {
-    let frame = shutter_button_rgba(SHUTTER_SIZE, capture_mode);
+    let frame = shutter_button_rgba(SHUTTER_SIZE, capture_mode, recording);
     write_kitty_image(
         out,
         KittyFramePlacement {
@@ -540,7 +553,122 @@ pub(crate) fn write_kitty_mode_pill(
     )
 }
 
-fn shutter_button_rgba(size: u32, capture_mode: CaptureMode) -> Vec<u8> {
+pub(crate) fn write_kitty_recording_timer(
+    out: &mut impl Write,
+    area: ImageArea,
+    elapsed: std::time::Duration,
+    sequence: &mut Vec<u8>,
+) -> io::Result<()> {
+    let frame = recording_timer_rgba(RECORDING_TIMER_WIDTH, RECORDING_TIMER_HEIGHT, elapsed);
+    write_kitty_image(
+        out,
+        KittyFramePlacement {
+            image_id: KITTY_TIMER_IMAGE_ID,
+            placement_id: KITTY_TIMER_PLACEMENT_ID,
+            z_index: TIMER_Z_INDEX,
+            previous_image_id: None,
+            width: RECORDING_TIMER_WIDTH,
+            height: RECORDING_TIMER_HEIGHT,
+            area,
+        },
+        &frame,
+        32,
+        sequence,
+    )
+}
+
+fn recording_timer_rgba(width: u32, height: u32, elapsed: std::time::Duration) -> Vec<u8> {
+    let mut frame = vec![0_u8; (width * height * 4) as usize];
+    fill_rounded_rect(
+        &mut frame,
+        width,
+        height,
+        RoundedRect {
+            x: 4.0,
+            y: 4.0,
+            width: f64::from(width - 8),
+            height: f64::from(height - 8),
+            radius: 24.0,
+        },
+        [24, 24, 27],
+        168,
+    );
+    fill_ellipse(
+        &mut frame,
+        width,
+        height,
+        Ellipse {
+            x: 44.0,
+            y: f64::from(height) / 2.0,
+            radius_x: 10.5,
+            radius_y: 5.0,
+        },
+        [239, 68, 68],
+        245,
+    );
+
+    let total_seconds = elapsed.as_secs().min(99 * 60 + 59);
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    let text = format!("{minutes:02}:{seconds:02}");
+    draw_timer_text(&mut frame, width, height, 72, 11, &text);
+    frame
+}
+
+fn draw_timer_text(frame: &mut [u8], width: u32, height: u32, x: u32, y: u32, text: &str) {
+    let mut cursor = x;
+    for ch in text.bytes() {
+        match ch {
+            b'0'..=b'9' => {
+                draw_timer_digit(frame, width, height, cursor, y, ch - b'0');
+                cursor += 22;
+            }
+            b':' => {
+                fill_timer_bar(frame, width, height, cursor + 3, y + 8, 4, 4);
+                fill_timer_bar(frame, width, height, cursor + 3, y + 20, 4, 4);
+                cursor += 12;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn draw_timer_digit(frame: &mut [u8], width: u32, height: u32, x: u32, y: u32, digit: u8) {
+    const DIGITS: [u32; 10] = [
+        0b111_101_101_101_101_101_111,
+        0b010_110_010_010_010_010_111,
+        0b111_001_001_111_100_100_111,
+        0b111_001_001_111_001_001_111,
+        0b101_101_101_111_001_001_001,
+        0b111_100_100_111_001_001_111,
+        0b111_100_100_111_101_101_111,
+        0b111_001_001_010_010_010_010,
+        0b111_101_101_111_101_101_111,
+        0b111_101_101_111_001_001_111,
+    ];
+    let Some(mask) = DIGITS.get(digit as usize).copied() else {
+        return;
+    };
+    for row in 0..7 {
+        for col in 0..3 {
+            let bit = 20 - (row * 3 + col);
+            if (mask & (1 << bit)) != 0 {
+                fill_timer_bar(frame, width, height, x + col * 6, y + row * 4, 4, 3);
+            }
+        }
+    }
+}
+
+fn fill_timer_bar(frame: &mut [u8], width: u32, height: u32, x: u32, y: u32, cols: u32, rows: u32) {
+    for py in y..y.saturating_add(rows).min(height) {
+        for px in x..x.saturating_add(cols).min(width) {
+            let offset = rgba_offset(width, px, py);
+            blend_pixel(frame, offset, [250, 250, 250], 218);
+        }
+    }
+}
+
+fn shutter_button_rgba(size: u32, capture_mode: CaptureMode, recording: bool) -> Vec<u8> {
     let mut frame = vec![0_u8; (size * size * 4) as usize];
     let center = (f64::from(size) - 1.0) / 2.0;
     let outer_radius = f64::from(size) * 0.46;
@@ -550,6 +678,13 @@ fn shutter_button_rgba(size: u32, capture_mode: CaptureMode) -> Vec<u8> {
         CaptureMode::Photo => [250, 250, 251],
         CaptureMode::Video => [239, 68, 68],
     };
+    let stop_square = RoundedRect {
+        x: center - f64::from(size) * 0.20,
+        y: center - f64::from(size) * 0.20,
+        width: f64::from(size) * 0.40,
+        height: f64::from(size) * 0.40,
+        radius: f64::from(size) * 0.045,
+    };
 
     for y in 0..size {
         for x in 0..size {
@@ -558,7 +693,14 @@ fn shutter_button_rgba(size: u32, capture_mode: CaptureMode) -> Vec<u8> {
             let distance = (dx * dx + dy * dy).sqrt();
             let offset = rgba_offset(size, x, y);
 
-            let color = if distance <= inner_radius {
+            let stop_coverage = if recording {
+                rounded_rect_coverage(f64::from(x) + 0.5, f64::from(y) + 0.5, stop_square)
+            } else {
+                0.0
+            };
+            let color = if stop_coverage > 0.0 {
+                Some((inner_color, (stop_coverage * 255.0).round() as u8))
+            } else if !recording && distance <= inner_radius {
                 Some((inner_color, edge_alpha(distance, inner_radius)))
             } else if distance >= gap_radius && distance <= outer_radius {
                 let edge = edge_alpha(distance, outer_radius);
@@ -716,6 +858,42 @@ struct Circle {
     x: f64,
     y: f64,
     radius: f64,
+}
+
+#[derive(Clone, Copy)]
+struct Ellipse {
+    x: f64,
+    y: f64,
+    radius_x: f64,
+    radius_y: f64,
+}
+
+fn fill_ellipse(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    ellipse: Ellipse,
+    color: [u8; 3],
+    alpha: u8,
+) {
+    for y in 0..height {
+        for x in 0..width {
+            let dx = (f64::from(x) + 0.5 - ellipse.x) / ellipse.radius_x;
+            let dy = (f64::from(y) + 0.5 - ellipse.y) / ellipse.radius_y;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let coverage =
+                ((1.0 - distance) * ellipse.radius_x.min(ellipse.radius_y)).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                let offset = rgba_offset(width, x, y);
+                blend_pixel(
+                    frame,
+                    offset,
+                    color,
+                    (coverage * f64::from(alpha)).round() as u8,
+                );
+            }
+        }
+    }
 }
 
 fn fill_circle(
@@ -1083,7 +1261,7 @@ mod tests {
         let mut out = Vec::new();
         let mut scratch = Vec::new();
 
-        write_kitty_shutter_button(&mut out, area, CaptureMode::Photo, &mut scratch)
+        write_kitty_shutter_button(&mut out, area, CaptureMode::Photo, false, &mut scratch)
             .expect("shutter button should encode");
 
         let text = String::from_utf8_lossy(&out);
@@ -1095,7 +1273,7 @@ mod tests {
 
     #[test]
     fn shutter_button_rgba_has_transparent_corners_and_opaque_center() {
-        let frame = shutter_button_rgba(16, CaptureMode::Photo);
+        let frame = shutter_button_rgba(16, CaptureMode::Photo, false);
         let corner_alpha = frame[3];
         let center = ((8 * 16 + 8) * 4) as usize;
 
@@ -1107,11 +1285,24 @@ mod tests {
 
     #[test]
     fn video_mode_shutter_uses_red_inner_circle() {
-        let frame = shutter_button_rgba(16, CaptureMode::Video);
+        let frame = shutter_button_rgba(16, CaptureMode::Video, false);
         let center = ((8 * 16 + 8) * 4) as usize;
 
         assert_eq!(&frame[center..center + 3], &[239, 68, 68]);
         assert_eq!(frame[center + 3], 255);
+    }
+
+    #[test]
+    fn recording_shutter_uses_red_stop_square() {
+        let frame = shutter_button_rgba(32, CaptureMode::Video, true);
+        let center = ((16 * 32 + 16) * 4) as usize;
+        let outer_inner_circle_point = ((16 * 32 + 6) * 4) as usize;
+        let outer_ring_point = ((16 * 32 + 3) * 4) as usize;
+
+        assert_eq!(&frame[center..center + 3], &[239, 68, 68]);
+        assert_eq!(frame[center + 3], 255);
+        assert_eq!(frame[outer_inner_circle_point + 3], 0);
+        assert!(frame[outer_ring_point + 3] > 0);
     }
 
     #[test]
@@ -1133,6 +1324,32 @@ mod tests {
         assert!(text.contains("a=T,q=2,f=32,s=128,v=160"));
         assert!(text.contains(&format!("i={KITTY_MODE_IMAGE_ID}")));
         assert!(text.contains(&format!("p={KITTY_MODE_PLACEMENT_ID}")));
+    }
+
+    #[test]
+    fn recording_timer_uses_transparent_rgba_kitty_image() {
+        let area = ImageArea {
+            x: 3,
+            y: 1,
+            cols: 16,
+            rows: 3,
+        };
+        let mut out = Vec::new();
+        let mut scratch = Vec::new();
+
+        write_kitty_recording_timer(
+            &mut out,
+            area,
+            std::time::Duration::from_secs(65),
+            &mut scratch,
+        )
+        .expect("recording timer should encode");
+
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("\x1b[2;4H"));
+        assert!(text.contains("a=T,q=2,f=32,s=224,v=48"));
+        assert!(text.contains(&format!("i={KITTY_TIMER_IMAGE_ID}")));
+        assert!(text.contains(&format!("p={KITTY_TIMER_PLACEMENT_ID}")));
     }
 
     #[test]
@@ -1183,6 +1400,7 @@ mod tests {
                 rows: 8,
             }),
             mode_pill_area: None,
+            recording_timer_area: None,
             thumbnail_area: None,
         };
 
@@ -1192,6 +1410,7 @@ mod tests {
             &rx,
             Some(layout),
             &mut mode,
+            false,
             &mut capture_requested,
             &mut chrome_dirty,
         ));

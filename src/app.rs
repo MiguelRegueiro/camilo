@@ -7,18 +7,25 @@ use anyhow::{Result, bail};
 
 use crate::{
     capture::{
-        CameraStream, CaptureThumbnail, THUMBNAIL_SIZE, frame_len, latest_capture_thumbnail,
-        latest_image_path, save_capture, square_thumbnail,
+        CameraStream, CaptureThumbnail, THUMBNAIL_SIZE, VideoRecording, frame_len,
+        latest_capture_thumbnail, latest_image_path, save_capture, square_thumbnail,
     },
     cli,
     terminal::{
         CaptureMode, KITTY_IMAGE_IDS, KITTY_PLACEMENT_ID, KITTY_THUMBNAIL_IMAGE_IDS,
-        KITTY_THUMBNAIL_PLACEMENT_ID, KittyFramePlacement, TerminalGuard, clear_screen_and_images,
-        drain_input_events, draw_sidebar, enable_tmux_passthrough, inside_tmux, looks_like_kitty,
-        spawn_input_thread, ui_layout, write_kitty_delete_image, write_kitty_mode_pill,
-        write_kitty_rgb_frame, write_kitty_shutter_button,
+        KITTY_THUMBNAIL_PLACEMENT_ID, KITTY_TIMER_IMAGE_ID, KittyFramePlacement, TerminalGuard,
+        clear_screen_and_images, drain_input_events, draw_sidebar, enable_tmux_passthrough,
+        inside_tmux, looks_like_kitty, spawn_input_thread, ui_layout, write_kitty_delete_image,
+        write_kitty_mode_pill, write_kitty_recording_timer, write_kitty_rgb_frame,
+        write_kitty_shutter_button,
     },
 };
+
+struct ActiveRecording {
+    encoder: VideoRecording,
+    started_at: Instant,
+    last_timer_second: Option<u64>,
+}
 
 pub(crate) fn run() -> Result<()> {
     let config = cli::config_from_env()?;
@@ -53,12 +60,14 @@ pub(crate) fn run() -> Result<()> {
     let mut thumbnail_dirty = last_thumbnail.is_some();
     let mut next_thumbnail_rescan = Instant::now() + Duration::from_millis(750);
     let mut capture_requested = false;
+    let mut recording: Option<ActiveRecording> = None;
 
     loop {
         if drain_input_events(
             &stop_rx,
             last_layout,
             &mut capture_mode,
+            recording.is_some(),
             &mut capture_requested,
             &mut chrome_dirty,
         ) {
@@ -82,10 +91,15 @@ pub(crate) fn run() -> Result<()> {
             &stop_rx,
             last_layout,
             &mut capture_mode,
+            recording.is_some(),
             &mut capture_requested,
             &mut chrome_dirty,
         ) {
             break;
+        }
+
+        if let Some(recording) = recording.as_mut() {
+            recording.encoder.write_frame(&frame)?;
         }
 
         let layout = ui_layout(config.width, config.height);
@@ -102,7 +116,13 @@ pub(crate) fn run() -> Result<()> {
 
         if chrome_dirty {
             if let Some(area) = layout.shutter_area {
-                write_kitty_shutter_button(&mut out, area, capture_mode, &mut kitty_sequence)?;
+                write_kitty_shutter_button(
+                    &mut out,
+                    area,
+                    capture_mode,
+                    recording.is_some(),
+                    &mut kitty_sequence,
+                )?;
             }
             if let Some(area) = layout.mode_pill_area {
                 write_kitty_mode_pill(&mut out, area, capture_mode, &mut kitty_sequence)?;
@@ -111,14 +131,45 @@ pub(crate) fn run() -> Result<()> {
         }
 
         if capture_requested {
-            let path = save_capture(&config, &frame)?;
-            last_thumbnail = Some(CaptureThumbnail {
-                path,
-                frame: square_thumbnail(&frame, config.width, config.height, THUMBNAIL_SIZE),
-            });
-            thumbnail_dirty = true;
-            next_thumbnail_rescan = Instant::now() + Duration::from_millis(750);
+            match capture_mode {
+                CaptureMode::Photo => {
+                    let path = save_capture(&config, &frame)?;
+                    last_thumbnail = Some(CaptureThumbnail {
+                        path,
+                        frame: square_thumbnail(
+                            &frame,
+                            config.width,
+                            config.height,
+                            THUMBNAIL_SIZE,
+                        ),
+                    });
+                    thumbnail_dirty = true;
+                    next_thumbnail_rescan = Instant::now() + Duration::from_millis(750);
+                }
+                CaptureMode::Video => {
+                    if let Some(recording) = recording.take() {
+                        recording.encoder.stop()?;
+                        write_kitty_delete_image(&mut out, KITTY_TIMER_IMAGE_ID)?;
+                    } else {
+                        recording = Some(ActiveRecording {
+                            encoder: VideoRecording::start(&config)?,
+                            started_at: Instant::now(),
+                            last_timer_second: None,
+                        });
+                    }
+                    chrome_dirty = true;
+                }
+            }
             capture_requested = false;
+        }
+
+        if let (Some(recording), Some(area)) = (&mut recording, layout.recording_timer_area) {
+            let elapsed = recording.started_at.elapsed();
+            let elapsed_second = elapsed.as_secs();
+            if recording.last_timer_second != Some(elapsed_second) {
+                write_kitty_recording_timer(&mut out, area, elapsed, &mut kitty_sequence)?;
+                recording.last_timer_second = Some(elapsed_second);
+            }
         }
 
         if Instant::now() >= next_thumbnail_rescan {
@@ -178,6 +229,10 @@ pub(crate) fn run() -> Result<()> {
         }
 
         out.flush()?;
+    }
+
+    if let Some(recording) = recording.take() {
+        recording.encoder.stop()?;
     }
 
     Ok(())

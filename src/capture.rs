@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{self, ErrorKind, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdout, Command, Stdio},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -89,12 +89,138 @@ pub(crate) fn save_capture(config: &Config, frame: &[u8]) -> Result<PathBuf> {
     Ok(path)
 }
 
+pub(crate) struct VideoRecording {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stderr: Arc<Mutex<String>>,
+    stderr_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl VideoRecording {
+    pub(crate) fn start(config: &Config) -> Result<Self> {
+        fs::create_dir_all(&config.camera_dir).with_context(|| {
+            format!(
+                "failed to create camera directory {}",
+                config.camera_dir.display()
+            )
+        })?;
+        let path = video_path(&config.camera_dir)?;
+        let size = format!("{}x{}", config.width, config.height);
+        let framerate = config.fps.to_string();
+
+        let mut child = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "rawvideo",
+                "-pixel_format",
+                "rgb24",
+                "-video_size",
+                &size,
+                "-framerate",
+                &framerate,
+                "-i",
+                "pipe:0",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-y",
+            ])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to start ffmpeg to record video")?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to open ffmpeg video input"))?;
+        let stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("failed to capture ffmpeg video stderr"))?;
+        let (stderr, stderr_thread) = read_stderr_async(stderr_pipe);
+
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            stderr,
+            stderr_thread: Some(stderr_thread),
+        })
+    }
+
+    pub(crate) fn write_frame(&mut self, frame: &[u8]) -> Result<()> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow!("video recording input is closed"))?;
+        stdin
+            .write_all(frame)
+            .context("failed to send frame to video encoder")
+    }
+
+    pub(crate) fn stop(mut self) -> Result<()> {
+        drop(self.stdin.take());
+        let status = self
+            .child
+            .wait()
+            .context("failed to finish video recording")?;
+        if let Some(handle) = self.stderr_thread.take() {
+            let _ = handle.join();
+        }
+        if !status.success() {
+            let stderr = self.stderr_text();
+            bail!("failed to record video: {}", stderr.trim());
+        }
+        Ok(())
+    }
+
+    fn stderr_text(&self) -> String {
+        self.stderr
+            .lock()
+            .map(|text| text.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for VideoRecording {
+    fn drop(&mut self) {
+        if self.stdin.is_some() {
+            drop(self.stdin.take());
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if let Some(handle) = self.stderr_thread.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
 fn capture_path(camera_dir: &Path) -> Result<PathBuf> {
+    timestamped_media_path(camera_dir, "capture", "jpg")
+}
+
+fn video_path(camera_dir: &Path) -> Result<PathBuf> {
+    timestamped_media_path(camera_dir, "video", "mp4")
+}
+
+fn timestamped_media_path(camera_dir: &Path, prefix: &str, extension: &str) -> Result<PathBuf> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?;
-    let stem = format!("capture-{}-{:09}", now.as_secs(), now.subsec_nanos());
-    Ok(camera_dir.join(format!("{stem}.jpg")))
+    let stem = format!("{prefix}-{}-{:09}", now.as_secs(), now.subsec_nanos());
+    Ok(camera_dir.join(format!("{stem}.{extension}")))
 }
 
 pub(crate) fn latest_capture_thumbnail(camera_dir: &Path, size: u32) -> Option<CaptureThumbnail> {
@@ -208,6 +334,20 @@ pub(crate) fn square_thumbnail(
     out
 }
 
+fn read_stderr_async(stderr_pipe: ChildStderr) -> (Arc<Mutex<String>>, thread::JoinHandle<()>) {
+    let stderr = Arc::new(Mutex::new(String::new()));
+    let stderr_target = Arc::clone(&stderr);
+    let stderr_thread = thread::spawn(move || {
+        let mut stderr_pipe = stderr_pipe;
+        let mut text = String::new();
+        let _ = stderr_pipe.read_to_string(&mut text);
+        if let Ok(mut target) = stderr_target.lock() {
+            *target = text;
+        }
+    });
+    (stderr, stderr_thread)
+}
+
 pub(crate) struct CameraStream {
     child: Child,
     stdout: ChildStdout,
@@ -264,16 +404,7 @@ impl CameraStream {
             .stderr
             .take()
             .ok_or_else(|| anyhow!("failed to capture ffmpeg stderr"))?;
-        let stderr = Arc::new(Mutex::new(String::new()));
-        let stderr_target = Arc::clone(&stderr);
-        let stderr_thread = thread::spawn(move || {
-            let mut stderr_pipe = stderr_pipe;
-            let mut text = String::new();
-            let _ = stderr_pipe.read_to_string(&mut text);
-            if let Ok(mut target) = stderr_target.lock() {
-                *target = text;
-            }
-        });
+        let (stderr, stderr_thread) = read_stderr_async(stderr_pipe);
 
         Ok(Self {
             child,
@@ -359,6 +490,14 @@ mod tests {
         let thumbnail = square_thumbnail(&frame, 4, 2, 4);
 
         assert!(thumbnail.iter().all(|&byte| byte == 255));
+    }
+
+    #[test]
+    fn video_path_uses_mp4_extension() {
+        let path =
+            video_path(Path::new("/tmp/lumi-camera")).expect("video path should be generated");
+
+        assert_eq!(path.extension().and_then(OsStr::to_str), Some("mp4"));
     }
 
     #[test]

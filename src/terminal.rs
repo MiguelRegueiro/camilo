@@ -258,14 +258,14 @@ pub(crate) fn ui_layout(source_width: u32, source_height: u32) -> UiLayout {
         rows,
     };
 
-    let capture_button = (sidebar_cols > 0).then(|| Rect {
+    let shutter_slot = (sidebar_cols > 0).then(|| Rect {
         x: sidebar.x,
         y: rows.saturating_sub(5) / 2,
         cols: sidebar.cols,
         rows: 5.min(rows.max(1)),
     });
-    let shutter_area =
-        capture_button.and_then(|button| shutter_area(button, cell_width, cell_height));
+    let shutter_area = shutter_slot.and_then(|slot| shutter_area(slot, cell_width, cell_height));
+    let capture_button = shutter_area.map(capture_hitbox);
     let (mode_toggle, mode_pill_area) = mode_pill_area(sidebar);
     let thumbnail_area = thumbnail_area(sidebar, rows, cell_width, cell_height);
 
@@ -377,6 +377,15 @@ fn shutter_area(button: Rect, cell_width: f64, cell_height: f64) -> Option<Image
         cols,
         rows,
     })
+}
+
+fn capture_hitbox(area: ImageArea) -> Rect {
+    Rect {
+        x: area.x,
+        y: area.y,
+        cols: area.cols,
+        rows: area.rows,
+    }
 }
 
 fn terminal_pixel_size(cols: u16, rows: u16) -> (u32, u32) {
@@ -1124,6 +1133,26 @@ mod tests {
         assert!(text.contains("a=T,q=2,f=32,s=128,v=160"));
         assert!(text.contains(&format!("i={KITTY_MODE_IMAGE_ID}")));
         assert!(text.contains(&format!("p={KITTY_MODE_PLACEMENT_ID}")));
+    }
+
+    #[test]
+    fn capture_hitbox_matches_shutter_image_area() {
+        let area = ImageArea {
+            x: 18,
+            y: 7,
+            cols: 4,
+            rows: 3,
+        };
+
+        assert_eq!(
+            capture_hitbox(area),
+            Rect {
+                x: 18,
+                y: 7,
+                cols: 4,
+                rows: 3,
+            }
+        );
     }
 
     #[test]

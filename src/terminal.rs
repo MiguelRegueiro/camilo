@@ -321,12 +321,12 @@ fn mode_pill_area(sidebar: Rect) -> (Option<Rect>, Option<ImageArea>) {
         return (None, None);
     }
 
-    let cols = 12.min(sidebar.cols);
+    let cols = 10.min(sidebar.cols);
     let rect = Rect {
         x: sidebar.x + sidebar.cols.saturating_sub(cols) / 2,
         y: sidebar.y + 1,
         cols,
-        rows: 8,
+        rows: 7,
     };
     let area = ImageArea {
         x: rect.x,

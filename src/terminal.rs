@@ -25,13 +25,15 @@ use crossterm::{
 const KITTY_IMAGE_ID: u32 = 0x4c_55_4d; // "LUM", within the 24-bit foreground-color-safe range.
 pub(crate) const KITTY_IMAGE_IDS: [u32; 2] = [KITTY_IMAGE_ID, KITTY_IMAGE_ID + 1];
 pub(crate) const KITTY_THUMBNAIL_IMAGE_IDS: [u32; 2] = [KITTY_IMAGE_ID + 10, KITTY_IMAGE_ID + 11];
+pub(crate) const KITTY_SHUTTER_IMAGE_ID: u32 = KITTY_IMAGE_ID + 20;
 pub(crate) const KITTY_PLACEMENT_ID: u32 = 1;
 pub(crate) const KITTY_THUMBNAIL_PLACEMENT_ID: u32 = 2;
+pub(crate) const KITTY_SHUTTER_PLACEMENT_ID: u32 = 3;
 const KITTY_RAW_CHUNK_BYTES: usize = 3 * 4096 / 4;
 const SIDEBAR_COLS: u16 = 16;
 const MIN_PREVIEW_COLS: u16 = 20;
 const MIN_SIDEBAR_COLS: u16 = 12;
-const SIDEBAR_HOT: &str = "\x1b[38;2;245;245;246m";
+const SHUTTER_SIZE: u32 = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Rect {
@@ -63,6 +65,7 @@ pub(crate) struct UiLayout {
     pub(crate) preview_area: ImageArea,
     pub(crate) sidebar: Rect,
     pub(crate) capture_button: Option<Rect>,
+    pub(crate) shutter_area: Option<ImageArea>,
     pub(crate) thumbnail_area: Option<ImageArea>,
 }
 
@@ -220,6 +223,8 @@ pub(crate) fn ui_layout(source_width: u32, source_height: u32) -> UiLayout {
         cols: sidebar.cols,
         rows: 5.min(rows.max(1)),
     });
+    let shutter_area =
+        capture_button.and_then(|button| shutter_area(button, cell_width, cell_height));
     let thumbnail_area = thumbnail_area(sidebar, rows, cell_width, cell_height);
 
     UiLayout {
@@ -232,6 +237,7 @@ pub(crate) fn ui_layout(source_width: u32, source_height: u32) -> UiLayout {
         ),
         sidebar,
         capture_button,
+        shutter_area,
         thumbnail_area,
     }
 }
@@ -288,6 +294,25 @@ fn thumbnail_area(
     })
 }
 
+fn shutter_area(button: Rect, cell_width: f64, cell_height: f64) -> Option<ImageArea> {
+    if button.cols == 0 || button.rows == 0 {
+        return None;
+    }
+
+    let max_width_px = f64::from(button.cols) * cell_width;
+    let max_height_px = f64::from(button.rows) * cell_height;
+    let size_px = max_width_px.min(max_height_px) * 0.82;
+    let cols = ((size_px / cell_width).round() as u16).clamp(1, button.cols);
+    let rows = ((size_px / cell_height).round() as u16).clamp(1, button.rows);
+
+    Some(ImageArea {
+        x: button.x + button.cols.saturating_sub(cols) / 2,
+        y: button.y + button.rows.saturating_sub(rows) / 2,
+        cols,
+        rows,
+    })
+}
+
 fn terminal_pixel_size(cols: u16, rows: u16) -> (u32, u32) {
     let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
     let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, size.as_mut_ptr()) } == 0;
@@ -312,34 +337,7 @@ pub(crate) fn draw_sidebar(out: &mut impl Write, layout: UiLayout) -> io::Result
         return Ok(());
     }
 
-    if let Some(button) = layout.capture_button {
-        draw_capture_button(out, button)?;
-    }
-
     out.write_all(b"\x1b[0m")
-}
-
-fn draw_capture_button(out: &mut impl Write, button: Rect) -> io::Result<()> {
-    let width = 9;
-    let inner_x = button.x.saturating_add(1);
-    let inner_cols = button.cols.saturating_sub(1);
-    let x = inner_x + inner_cols.saturating_sub(width) / 2;
-    let center_y = button.y + button.rows / 2;
-
-    write_at(out, x, center_y.saturating_sub(2), SIDEBAR_HOT, "╭───────╮")?;
-    write_at(out, x, center_y.saturating_sub(1), SIDEBAR_HOT, "│       │")?;
-    write_at(out, x, center_y, SIDEBAR_HOT, "│   ●   │")?;
-    write_at(out, x, center_y.saturating_add(1), SIDEBAR_HOT, "│       │")?;
-    write_at(out, x, center_y.saturating_add(2), SIDEBAR_HOT, "╰───────╯")
-}
-
-fn write_at(out: &mut impl Write, x: u16, y: u16, style: &str, text: &str) -> io::Result<()> {
-    write!(
-        out,
-        "\x1b[{};{}H{style}{text}",
-        y.saturating_add(1),
-        x.saturating_add(1)
-    )
 }
 
 fn clear_images_sequence() -> &'static str {
@@ -357,6 +355,39 @@ pub(crate) fn write_kitty_rgb_frame(
     out: &mut impl Write,
     placement: KittyFramePlacement,
     frame: &[u8],
+    sequence: &mut Vec<u8>,
+) -> io::Result<()> {
+    write_kitty_image(out, placement, frame, 24, sequence)
+}
+
+pub(crate) fn write_kitty_shutter_button(
+    out: &mut impl Write,
+    area: ImageArea,
+    sequence: &mut Vec<u8>,
+) -> io::Result<()> {
+    let frame = shutter_button_rgba(SHUTTER_SIZE);
+    write_kitty_image(
+        out,
+        KittyFramePlacement {
+            image_id: KITTY_SHUTTER_IMAGE_ID,
+            placement_id: KITTY_SHUTTER_PLACEMENT_ID,
+            z_index: 2,
+            previous_image_id: None,
+            width: SHUTTER_SIZE,
+            height: SHUTTER_SIZE,
+            area,
+        },
+        &frame,
+        32,
+        sequence,
+    )
+}
+
+fn write_kitty_image(
+    out: &mut impl Write,
+    placement: KittyFramePlacement,
+    frame: &[u8],
+    pixel_format: u8,
     sequence: &mut Vec<u8>,
 ) -> io::Result<()> {
     sequence.clear();
@@ -379,7 +410,8 @@ pub(crate) fn write_kitty_rgb_frame(
         if first {
             write!(
                 sequence,
-                "\x1b_Ga=T,q=2,f=24,s={},v={},i={},p={},c={},r={},C=1,z={},m={};",
+                "\x1b_Ga=T,q=2,f={},s={},v={},i={},p={},c={},r={},C=1,z={},m={};",
+                pixel_format,
                 placement.width,
                 placement.height,
                 placement.image_id,
@@ -406,6 +438,46 @@ pub(crate) fn write_kitty_rgb_frame(
     }
 
     write_kitty_apc_bytes(out, sequence)
+}
+
+fn shutter_button_rgba(size: u32) -> Vec<u8> {
+    let mut frame = vec![0_u8; (size * size * 4) as usize];
+    let center = (f64::from(size) - 1.0) / 2.0;
+    let outer_radius = f64::from(size) * 0.46;
+    let inner_radius = f64::from(size) * 0.34;
+    let gap_radius = f64::from(size) * 0.39;
+
+    for y in 0..size {
+        for x in 0..size {
+            let dx = f64::from(x) - center;
+            let dy = f64::from(y) - center;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let offset = ((y * size + x) * 4) as usize;
+
+            let color = if distance <= inner_radius {
+                Some(([250, 250, 251], edge_alpha(distance, inner_radius)))
+            } else if distance >= gap_radius && distance <= outer_radius {
+                let edge = edge_alpha(distance, outer_radius);
+                let inner_edge = edge_alpha(gap_radius, distance);
+                Some(([244, 244, 245], edge.min(inner_edge)))
+            } else {
+                None
+            };
+
+            if let Some(([r, g, b], alpha)) = color {
+                frame[offset] = r;
+                frame[offset + 1] = g;
+                frame[offset + 2] = b;
+                frame[offset + 3] = alpha;
+            }
+        }
+    }
+
+    frame
+}
+
+fn edge_alpha(distance: f64, radius: f64) -> u8 {
+    ((radius - distance).clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 fn write_kitty_apc_bytes(out: &mut impl Write, sequence: &[u8]) -> io::Result<()> {
@@ -577,5 +649,38 @@ mod tests {
             .find("a=d,d=I,q=2,i=7")
             .expect("old buffer delete should be present");
         assert!(draw < delete);
+    }
+
+    #[test]
+    fn shutter_button_uses_transparent_rgba_kitty_image() {
+        let area = ImageArea {
+            x: 2,
+            y: 3,
+            cols: 6,
+            rows: 4,
+        };
+        let mut out = Vec::new();
+        let mut scratch = Vec::new();
+
+        write_kitty_shutter_button(&mut out, area, &mut scratch)
+            .expect("shutter button should encode");
+
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("\x1b[4;3H"));
+        assert!(text.contains("a=T,q=2,f=32,s=128,v=128"));
+        assert!(text.contains(&format!("i={KITTY_SHUTTER_IMAGE_ID}")));
+        assert!(text.contains(&format!("p={KITTY_SHUTTER_PLACEMENT_ID}")));
+    }
+
+    #[test]
+    fn shutter_button_rgba_has_transparent_corners_and_opaque_center() {
+        let frame = shutter_button_rgba(16);
+        let corner_alpha = frame[3];
+        let center = ((8 * 16 + 8) * 4) as usize;
+
+        assert_eq!(frame.len(), 16 * 16 * 4);
+        assert_eq!(corner_alpha, 0);
+        assert_eq!(&frame[center..center + 3], &[250, 250, 251]);
+        assert_eq!(frame[center + 3], 255);
     }
 }

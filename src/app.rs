@@ -16,6 +16,7 @@ use crate::{
         KITTY_THUMBNAIL_PLACEMENT_ID, KittyFramePlacement, TerminalGuard, clear_screen_and_images,
         drain_input_events, draw_sidebar, enable_tmux_passthrough, inside_tmux, looks_like_kitty,
         spawn_input_thread, ui_layout, write_kitty_delete_image, write_kitty_rgb_frame,
+        write_kitty_shutter_button,
     },
 };
 
@@ -77,6 +78,9 @@ pub(crate) fn run() -> Result<()> {
         if last_layout != Some(layout) {
             clear_screen_and_images(&mut out)?;
             draw_sidebar(&mut out, layout)?;
+            if let Some(area) = layout.shutter_area {
+                write_kitty_shutter_button(&mut out, area, &mut kitty_sequence)?;
+            }
             last_layout = Some(layout);
             previous_image_id = None;
             previous_thumbnail_image_id = None;

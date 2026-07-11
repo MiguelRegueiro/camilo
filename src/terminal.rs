@@ -1,0 +1,581 @@
+use std::{
+    env,
+    ffi::OsStr,
+    io::{self, Write},
+    process::{Command, Stdio},
+    sync::mpsc,
+    thread,
+};
+
+use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use crossterm::{
+    cursor::{Hide, Show},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+        MouseEventKind,
+    },
+    execute,
+    terminal::{
+        self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
+};
+
+const KITTY_IMAGE_ID: u32 = 0x4c_55_4d; // "LUM", within the 24-bit foreground-color-safe range.
+pub(crate) const KITTY_IMAGE_IDS: [u32; 2] = [KITTY_IMAGE_ID, KITTY_IMAGE_ID + 1];
+pub(crate) const KITTY_THUMBNAIL_IMAGE_IDS: [u32; 2] = [KITTY_IMAGE_ID + 10, KITTY_IMAGE_ID + 11];
+pub(crate) const KITTY_PLACEMENT_ID: u32 = 1;
+pub(crate) const KITTY_THUMBNAIL_PLACEMENT_ID: u32 = 2;
+const KITTY_RAW_CHUNK_BYTES: usize = 3 * 4096 / 4;
+const SIDEBAR_COLS: u16 = 16;
+const MIN_PREVIEW_COLS: u16 = 20;
+const MIN_SIDEBAR_COLS: u16 = 12;
+const SIDEBAR_HOT: &str = "\x1b[38;2;245;245;246m";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Rect {
+    pub(crate) x: u16,
+    pub(crate) y: u16,
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
+}
+
+impl Rect {
+    fn contains(self, x: u16, y: u16) -> bool {
+        x >= self.x
+            && x < self.x.saturating_add(self.cols)
+            && y >= self.y
+            && y < self.y.saturating_add(self.rows)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ImageArea {
+    pub(crate) x: u16,
+    pub(crate) y: u16,
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UiLayout {
+    pub(crate) preview_area: ImageArea,
+    pub(crate) sidebar: Rect,
+    pub(crate) capture_button: Option<Rect>,
+    pub(crate) thumbnail_area: Option<ImageArea>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KittyFramePlacement {
+    pub(crate) image_id: u32,
+    pub(crate) placement_id: u32,
+    pub(crate) z_index: i32,
+    pub(crate) previous_image_id: Option<u32>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) area: ImageArea,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InputEvent {
+    Quit,
+    Capture,
+    Click { x: u16, y: u16 },
+}
+
+pub(crate) fn looks_like_kitty() -> bool {
+    env::var("TERM")
+        .map(|term| term.to_ascii_lowercase().contains("kitty"))
+        .unwrap_or(false)
+        || env::var_os("KITTY_WINDOW_ID").is_some()
+        || env::var("TERM_PROGRAM")
+            .map(|term| term.eq_ignore_ascii_case("kitty"))
+            .unwrap_or(false)
+}
+
+pub(crate) struct TerminalGuard;
+
+impl TerminalGuard {
+    pub(crate) fn enter() -> Result<Self> {
+        enable_raw_mode().context("failed to enable raw terminal mode")?;
+        let mut stdout = io::stdout();
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            Clear(ClearType::All),
+            Hide,
+            EnableMouseCapture
+        )
+        .context("failed to enter terminal preview mode")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        let _ = write_kitty_apc_bytes(&mut stdout, clear_images_sequence().as_bytes());
+        let _ = execute!(stdout, DisableMouseCapture, Show, LeaveAlternateScreen);
+        let _ = stdout.flush();
+        let _ = disable_raw_mode();
+    }
+}
+
+pub(crate) fn spawn_input_thread() -> mpsc::Receiver<InputEvent> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        loop {
+            match event::read() {
+                Ok(Event::Key(key))
+                    if key.code == KeyCode::Esc
+                        || key.code == KeyCode::Char('q')
+                        || (key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)) =>
+                {
+                    let _ = tx.send(InputEvent::Quit);
+                    break;
+                }
+                Ok(Event::Key(key))
+                    if key.code == KeyCode::Char(' ') || key.code == KeyCode::Enter =>
+                {
+                    if tx.send(InputEvent::Capture).is_err() {
+                        break;
+                    }
+                }
+                Ok(Event::Mouse(mouse))
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
+                {
+                    if tx
+                        .send(InputEvent::Click {
+                            x: mouse.column,
+                            y: mouse.row,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = tx.send(InputEvent::Quit);
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
+pub(crate) fn drain_input_events(
+    rx: &mpsc::Receiver<InputEvent>,
+    layout: Option<UiLayout>,
+    capture_requested: &mut bool,
+) -> bool {
+    let mut should_quit = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            InputEvent::Quit => should_quit = true,
+            InputEvent::Capture => *capture_requested = true,
+            InputEvent::Click { x, y } => {
+                if layout
+                    .and_then(|layout| layout.capture_button)
+                    .is_some_and(|button| button.contains(x, y))
+                {
+                    *capture_requested = true;
+                }
+            }
+        }
+    }
+    should_quit
+}
+
+pub(crate) fn ui_layout(source_width: u32, source_height: u32) -> UiLayout {
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let (pixel_width, pixel_height) = terminal_pixel_size(cols, rows);
+    let cell_width = f64::from(pixel_width) / f64::from(cols.max(1));
+    let cell_height = f64::from(pixel_height) / f64::from(rows.max(1));
+    let sidebar_cols = if cols >= MIN_PREVIEW_COLS + MIN_SIDEBAR_COLS {
+        SIDEBAR_COLS.min(cols.saturating_sub(MIN_PREVIEW_COLS))
+    } else {
+        0
+    };
+    let preview_cols = cols.saturating_sub(sidebar_cols).max(1);
+    let sidebar = Rect {
+        x: preview_cols,
+        y: 0,
+        cols: sidebar_cols,
+        rows,
+    };
+    let preview_bounds = Rect {
+        x: 0,
+        y: 0,
+        cols: preview_cols,
+        rows,
+    };
+
+    let capture_button = (sidebar_cols > 0).then(|| Rect {
+        x: sidebar.x,
+        y: rows.saturating_sub(5) / 2,
+        cols: sidebar.cols,
+        rows: 5.min(rows.max(1)),
+    });
+    let thumbnail_area = thumbnail_area(sidebar, rows, cell_width, cell_height);
+
+    UiLayout {
+        preview_area: fit_image_area(
+            source_width,
+            source_height,
+            preview_bounds,
+            cell_width,
+            cell_height,
+        ),
+        sidebar,
+        capture_button,
+        thumbnail_area,
+    }
+}
+
+fn fit_image_area(
+    source_width: u32,
+    source_height: u32,
+    bounds: Rect,
+    cell_width: f64,
+    cell_height: f64,
+) -> ImageArea {
+    let cols = bounds.cols.max(1);
+    let rows = bounds.rows.max(1);
+    let max_width_px = f64::from(cols) * cell_width;
+    let max_height_px = f64::from(rows) * cell_height;
+    let source_aspect = f64::from(source_width) / f64::from(source_height.max(1));
+
+    let (display_width_px, display_height_px) = if max_width_px / max_height_px > source_aspect {
+        (max_height_px * source_aspect, max_height_px)
+    } else {
+        (max_width_px, max_width_px / source_aspect)
+    };
+
+    let display_cols = ((display_width_px / cell_width).floor() as u16).clamp(1, cols.max(1));
+    let display_rows = ((display_height_px / cell_height).floor() as u16).clamp(1, rows.max(1));
+
+    ImageArea {
+        x: bounds.x + cols.saturating_sub(display_cols) / 2,
+        y: bounds.y + rows.saturating_sub(display_rows) / 2,
+        cols: display_cols,
+        rows: display_rows,
+    }
+}
+
+fn thumbnail_area(
+    sidebar: Rect,
+    terminal_rows: u16,
+    cell_width: f64,
+    cell_height: f64,
+) -> Option<ImageArea> {
+    if sidebar.cols < 4 || terminal_rows < 4 {
+        return None;
+    }
+
+    let thumb_cols = sidebar.cols.saturating_sub(2).max(1);
+    let thumb_rows = ((f64::from(thumb_cols) * cell_width / cell_height).round() as u16)
+        .clamp(1, terminal_rows.saturating_sub(2).max(1));
+
+    Some(ImageArea {
+        x: sidebar.x + 1,
+        y: terminal_rows.saturating_sub(thumb_rows + 1),
+        cols: thumb_cols,
+        rows: thumb_rows,
+    })
+}
+
+fn terminal_pixel_size(cols: u16, rows: u16) -> (u32, u32) {
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
+    let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, size.as_mut_ptr()) } == 0;
+    if ok {
+        let size = unsafe { size.assume_init() };
+        if size.ws_xpixel > 0 && size.ws_ypixel > 0 {
+            return (u32::from(size.ws_xpixel), u32::from(size.ws_ypixel));
+        }
+    }
+
+    // Conservative fallback for terminal emulators that do not expose pixel size.
+    (u32::from(cols.max(1)) * 8, u32::from(rows.max(1)) * 16)
+}
+
+pub(crate) fn clear_screen_and_images(out: &mut impl Write) -> io::Result<()> {
+    write_kitty_apc_bytes(out, clear_images_sequence().as_bytes())?;
+    out.write_all(b"\x1b[2J\x1b[H")
+}
+
+pub(crate) fn draw_sidebar(out: &mut impl Write, layout: UiLayout) -> io::Result<()> {
+    if layout.sidebar.cols == 0 {
+        return Ok(());
+    }
+
+    if let Some(button) = layout.capture_button {
+        draw_capture_button(out, button)?;
+    }
+
+    out.write_all(b"\x1b[0m")
+}
+
+fn draw_capture_button(out: &mut impl Write, button: Rect) -> io::Result<()> {
+    let width = 9;
+    let inner_x = button.x.saturating_add(1);
+    let inner_cols = button.cols.saturating_sub(1);
+    let x = inner_x + inner_cols.saturating_sub(width) / 2;
+    let center_y = button.y + button.rows / 2;
+
+    write_at(out, x, center_y.saturating_sub(2), SIDEBAR_HOT, "╭───────╮")?;
+    write_at(out, x, center_y.saturating_sub(1), SIDEBAR_HOT, "│       │")?;
+    write_at(out, x, center_y, SIDEBAR_HOT, "│   ●   │")?;
+    write_at(out, x, center_y.saturating_add(1), SIDEBAR_HOT, "│       │")?;
+    write_at(out, x, center_y.saturating_add(2), SIDEBAR_HOT, "╰───────╯")
+}
+
+fn write_at(out: &mut impl Write, x: u16, y: u16, style: &str, text: &str) -> io::Result<()> {
+    write!(
+        out,
+        "\x1b[{};{}H{style}{text}",
+        y.saturating_add(1),
+        x.saturating_add(1)
+    )
+}
+
+fn clear_images_sequence() -> &'static str {
+    "\x1b_Ga=d,d=A,q=2\x1b\\"
+}
+
+pub(crate) fn write_kitty_delete_image(out: &mut impl Write, image_id: u32) -> io::Result<()> {
+    write_kitty_apc_bytes(
+        out,
+        format!("\x1b_Ga=d,d=I,q=2,i={image_id}\x1b\\").as_bytes(),
+    )
+}
+
+pub(crate) fn write_kitty_rgb_frame(
+    out: &mut impl Write,
+    placement: KittyFramePlacement,
+    frame: &[u8],
+    sequence: &mut Vec<u8>,
+) -> io::Result<()> {
+    sequence.clear();
+    write!(
+        sequence,
+        "\x1b[{};{}H",
+        placement.area.y.saturating_add(1),
+        placement.area.x.saturating_add(1)
+    )?;
+
+    let mut offset = 0;
+    let mut first = true;
+    let mut encoded = [0_u8; 4096];
+    while offset < frame.len() {
+        let end = (offset + KITTY_RAW_CHUNK_BYTES).min(frame.len());
+        let more = end < frame.len();
+        let encoded_len = BASE64
+            .encode_slice(&frame[offset..end], &mut encoded)
+            .map_err(io::Error::other)?;
+        if first {
+            write!(
+                sequence,
+                "\x1b_Ga=T,q=2,f=24,s={},v={},i={},p={},c={},r={},C=1,z={},m={};",
+                placement.width,
+                placement.height,
+                placement.image_id,
+                placement.placement_id,
+                placement.area.cols,
+                placement.area.rows,
+                placement.z_index,
+                if more { 1 } else { 0 },
+            )?;
+            sequence.extend_from_slice(&encoded[..encoded_len]);
+            sequence.extend_from_slice(b"\x1b\\");
+            first = false;
+        } else {
+            write!(sequence, "\x1b_Gm={};", if more { 1 } else { 0 },)?;
+            sequence.extend_from_slice(&encoded[..encoded_len]);
+            sequence.extend_from_slice(b"\x1b\\");
+        }
+        offset = end;
+    }
+    if let Some(previous_image_id) = placement.previous_image_id
+        && previous_image_id != placement.image_id
+    {
+        write!(sequence, "\x1b_Ga=d,d=I,q=2,i={previous_image_id}\x1b\\")?;
+    }
+
+    write_kitty_apc_bytes(out, sequence)
+}
+
+fn write_kitty_apc_bytes(out: &mut impl Write, sequence: &[u8]) -> io::Result<()> {
+    if inside_tmux() {
+        out.write_all(&wrap_kitty_apcs_for_tmux(sequence))
+    } else {
+        out.write_all(sequence)
+    }
+}
+
+pub(crate) fn inside_tmux() -> bool {
+    env::var_os("TMUX").is_some()
+}
+
+pub(crate) fn enable_tmux_passthrough() {
+    let mut args = vec!["set-option".into(), "-p".into(), "-q".into()];
+    if let Some(pane) = env::var_os("TMUX_PANE")
+        && !pane.is_empty()
+    {
+        args.push("-t".into());
+        args.push(pane);
+    }
+    args.push("allow-passthrough".into());
+    args.push("on".into());
+
+    let _ = Command::new("tmux")
+        .args(args.iter().map(OsStr::new))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn wrap_kitty_apcs_for_tmux(sequence: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(sequence.len() + sequence.len() / 4);
+    let mut i = 0;
+    while i < sequence.len() {
+        if sequence.len() - i >= 3
+            && &sequence[i..i + 3] == b"\x1b_G"
+            && let Some(relative_end) = sequence[i + 3..].iter().position(|&byte| byte == 0x1b)
+            && sequence.get(i + 3 + relative_end + 1) == Some(&b'\\')
+        {
+            let body_end = i + 3 + relative_end;
+            wrap_sequence_for_tmux(&sequence[i..body_end + 2], &mut out);
+            i = body_end + 2;
+            continue;
+        }
+        out.push(sequence[i]);
+        i += 1;
+    }
+    out
+}
+
+fn wrap_sequence_for_tmux(sequence: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(b"\x1bPtmux;");
+    for &byte in sequence {
+        if byte == 0x1b {
+            out.extend_from_slice(b"\x1b\x1b");
+        } else {
+            out.push(byte);
+        }
+    }
+    out.extend_from_slice(b"\x1b\\");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kitty_frame_sequence_transmits_raw_rgb_at_requested_area() {
+        let frame = [0, 0, 0, 255, 255, 255];
+        let area = ImageArea {
+            x: 1,
+            y: 2,
+            cols: 3,
+            rows: 4,
+        };
+        let mut out = Vec::new();
+        let mut scratch = Vec::new();
+
+        write_kitty_rgb_frame(
+            &mut out,
+            KittyFramePlacement {
+                image_id: 7,
+                placement_id: 9,
+                z_index: 11,
+                previous_image_id: None,
+                width: 2,
+                height: 1,
+                area,
+            },
+            &frame,
+            &mut scratch,
+        )
+        .expect("kitty frame should encode");
+
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("\x1b[3;2H"));
+        assert!(text.contains("a=T,q=2,f=24,s=2,v=1,i=7,p=9,c=3,r=4,C=1,z=11,m=0;"));
+    }
+
+    #[test]
+    fn kitty_frame_sequence_chunks_large_frames() {
+        let frame = vec![0x7f; KITTY_RAW_CHUNK_BYTES + 1];
+        let area = ImageArea {
+            x: 0,
+            y: 0,
+            cols: 10,
+            rows: 5,
+        };
+        let mut out = Vec::new();
+        let mut scratch = Vec::new();
+
+        write_kitty_rgb_frame(
+            &mut out,
+            KittyFramePlacement {
+                image_id: 7,
+                placement_id: 9,
+                z_index: 12,
+                previous_image_id: None,
+                width: 1025,
+                height: 1,
+                area,
+            },
+            &frame,
+            &mut scratch,
+        )
+        .expect("kitty frame should encode");
+
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("m=1;"));
+        assert!(text.contains("\x1b_Gm=0;") || text.contains("\x1b\x1b_Gm=0;"));
+    }
+
+    #[test]
+    fn kitty_frame_sequence_deletes_previous_buffer_after_new_frame() {
+        let frame = [0, 0, 0, 255, 255, 255];
+        let area = ImageArea {
+            x: 0,
+            y: 0,
+            cols: 2,
+            rows: 1,
+        };
+        let mut out = Vec::new();
+        let mut scratch = Vec::new();
+
+        write_kitty_rgb_frame(
+            &mut out,
+            KittyFramePlacement {
+                image_id: 8,
+                placement_id: 9,
+                z_index: 13,
+                previous_image_id: Some(7),
+                width: 2,
+                height: 1,
+                area,
+            },
+            &frame,
+            &mut scratch,
+        )
+        .expect("kitty frame should encode");
+
+        let text = String::from_utf8_lossy(&out);
+        let draw = text
+            .find("a=T,q=2")
+            .expect("new frame draw should be present");
+        let delete = text
+            .find("a=d,d=I,q=2,i=7")
+            .expect("old buffer delete should be present");
+        assert!(draw < delete);
+    }
+}

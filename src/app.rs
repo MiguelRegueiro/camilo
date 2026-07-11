@@ -12,11 +12,11 @@ use crate::{
     },
     cli,
     terminal::{
-        KITTY_IMAGE_IDS, KITTY_PLACEMENT_ID, KITTY_THUMBNAIL_IMAGE_IDS,
+        CaptureMode, KITTY_IMAGE_IDS, KITTY_PLACEMENT_ID, KITTY_THUMBNAIL_IMAGE_IDS,
         KITTY_THUMBNAIL_PLACEMENT_ID, KittyFramePlacement, TerminalGuard, clear_screen_and_images,
         drain_input_events, draw_sidebar, enable_tmux_passthrough, inside_tmux, looks_like_kitty,
-        spawn_input_thread, ui_layout, write_kitty_delete_image, write_kitty_rgb_frame,
-        write_kitty_shutter_button,
+        spawn_input_thread, ui_layout, write_kitty_delete_image, write_kitty_mode_pill,
+        write_kitty_rgb_frame, write_kitty_shutter_button,
     },
 };
 
@@ -43,6 +43,8 @@ pub(crate) fn run() -> Result<()> {
     let mut out = BufWriter::with_capacity(frame_len + frame_len / 2, stdout.lock());
     let mut kitty_sequence = Vec::with_capacity(frame_len + frame_len / 2 + 4096);
     let mut last_layout = None;
+    let mut capture_mode = CaptureMode::Photo;
+    let mut chrome_dirty = true;
     let mut previous_image_id = None;
     let mut previous_thumbnail_image_id = None;
     let mut frame_serial = 0_u32;
@@ -53,7 +55,13 @@ pub(crate) fn run() -> Result<()> {
     let mut capture_requested = false;
 
     loop {
-        if drain_input_events(&stop_rx, last_layout, &mut capture_requested) {
+        if drain_input_events(
+            &stop_rx,
+            last_layout,
+            &mut capture_mode,
+            &mut capture_requested,
+            &mut chrome_dirty,
+        ) {
             break;
         }
 
@@ -70,7 +78,13 @@ pub(crate) fn run() -> Result<()> {
             Err(error) => bail!("failed to read camera frame: {error}"),
         }
 
-        if drain_input_events(&stop_rx, last_layout, &mut capture_requested) {
+        if drain_input_events(
+            &stop_rx,
+            last_layout,
+            &mut capture_mode,
+            &mut capture_requested,
+            &mut chrome_dirty,
+        ) {
             break;
         }
 
@@ -78,14 +92,22 @@ pub(crate) fn run() -> Result<()> {
         if last_layout != Some(layout) {
             clear_screen_and_images(&mut out)?;
             draw_sidebar(&mut out, layout)?;
-            if let Some(area) = layout.shutter_area {
-                write_kitty_shutter_button(&mut out, area, &mut kitty_sequence)?;
-            }
             last_layout = Some(layout);
             previous_image_id = None;
             previous_thumbnail_image_id = None;
             frame_serial = 0;
             thumbnail_dirty = true;
+            chrome_dirty = true;
+        }
+
+        if chrome_dirty {
+            if let Some(area) = layout.shutter_area {
+                write_kitty_shutter_button(&mut out, area, capture_mode, &mut kitty_sequence)?;
+            }
+            if let Some(area) = layout.mode_pill_area {
+                write_kitty_mode_pill(&mut out, area, capture_mode, &mut kitty_sequence)?;
+            }
+            chrome_dirty = false;
         }
 
         if capture_requested {

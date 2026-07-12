@@ -42,6 +42,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Config> {
             }
             "--force" => config.force = true,
             "--mirror-horizontal" => config.mirror_horizontal = true,
+            "--no-audio" => config.audio = false,
+            "--audio-input" => {
+                config.audio_input = args
+                    .next()
+                    .ok_or_else(|| anyhow!("{arg} requires an input name"))?;
+                config.audio = true;
+            }
             _ => bail!("unknown argument: {arg}"),
         }
     }
@@ -65,15 +72,15 @@ fn parse_positive_arg(flag: &str, value: Option<String>) -> Result<u32> {
 fn print_help() {
     println!(
         "\
-camilo - live camera preview for Kitty-compatible terminals
+camilo - camera app for the terminal
 
 Usage:
-  camilo [--device /dev/video0] [--width 1920] [--height 1080] [--fps 30] [--camera-dir ~/Pictures/Camera] [--mirror-horizontal] [--force]
+  camilo [--device /dev/video0] [--width 1920] [--height 1080] [--fps 30] [--camera-dir ~/Pictures/Camera] [--mirror-horizontal] [--audio-input default] [--no-audio] [--force]
 
 Controls:
   Right-side shutter button  take pictures or start/stop video recording
   Right-side mode switch     toggle photo/video mode
-  q, Esc, Ctrl-C             exit
+  q                          exit
 "
     );
 }

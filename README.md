@@ -32,12 +32,20 @@ camera_dir = "~/Pictures/Camera"
 # width = 1920
 # height = 1080
 # fps = 30
+# audio = true
+# audio_input = "default"
 ```
 
 To mirror only for one run:
 
 ```sh
 cargo run --release -- --mirror-horizontal
+```
+
+Audio is recorded from the system default microphone. Set `audio_input` to override it, or disable audio for one run:
+
+```sh
+cargo run --release -- --no-audio
 ```
 
 ## Controls

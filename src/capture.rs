@@ -183,6 +183,83 @@ pub(crate) fn save_capture(config: &Config, frame: &[u8]) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn recording_ffmpeg_args(
+    config: &Config,
+    path: &Path,
+    video_size: &str,
+    framerate: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-nostdin".to_string(),
+        "-f".to_string(),
+        "rawvideo".to_string(),
+        "-pixel_format".to_string(),
+        "rgb24".to_string(),
+        "-video_size".to_string(),
+        video_size.to_string(),
+        "-framerate".to_string(),
+        framerate.to_string(),
+        "-i".to_string(),
+        "pipe:0".to_string(),
+    ];
+
+    if config.audio {
+        let (backend, input) = ffmpeg_audio_input(&config.audio_input);
+        args.extend([
+            "-f".to_string(),
+            backend.to_string(),
+            "-i".to_string(),
+            input.to_string(),
+        ]);
+    } else {
+        args.push("-an".to_string());
+    }
+
+    args.extend([
+        "-c:v".to_string(),
+        "libx264".to_string(),
+        "-preset".to_string(),
+        "veryfast".to_string(),
+        "-crf".to_string(),
+        "18".to_string(),
+        "-pix_fmt".to_string(),
+        "yuv420p".to_string(),
+    ]);
+
+    if config.audio {
+        args.extend([
+            "-c:a".to_string(),
+            "aac".to_string(),
+            "-b:a".to_string(),
+            "128k".to_string(),
+            "-shortest".to_string(),
+        ]);
+    }
+
+    args.extend([
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        "-y".to_string(),
+        path.to_string_lossy().into_owned(),
+    ]);
+
+    args
+}
+
+fn ffmpeg_audio_input(input: &str) -> (&str, &str) {
+    input
+        .split_once(':')
+        .filter(|(backend, device)| is_supported_audio_backend(backend) && !device.is_empty())
+        .unwrap_or(("pulse", input))
+}
+
+fn is_supported_audio_backend(backend: &str) -> bool {
+    matches!(backend, "pulse" | "alsa" | "oss" | "avfoundation")
+}
+
 pub(crate) struct VideoRecording {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -202,36 +279,9 @@ impl VideoRecording {
         let size = format!("{}x{}", config.width, config.height);
         let framerate = config.fps.to_string();
 
+        let args = recording_ffmpeg_args(config, &path, &size, &framerate);
         let mut child = Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-f",
-                "rawvideo",
-                "-pixel_format",
-                "rgb24",
-                "-video_size",
-                &size,
-                "-framerate",
-                &framerate,
-                "-i",
-                "pipe:0",
-                "-an",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "18",
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                "-y",
-            ])
-            .arg(&path)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -626,6 +676,54 @@ mod tests {
             video_path(Path::new("/tmp/camilo-camera")).expect("video path should be generated");
 
         assert_eq!(path.extension().and_then(OsStr::to_str), Some("mp4"));
+    }
+
+    #[test]
+    fn recording_args_enable_default_pulse_audio() {
+        let config = Config::default();
+        let args = recording_ffmpeg_args(&config, Path::new("/tmp/camilo.mp4"), "1920x1080", "30");
+
+        assert!(
+            args.windows(4)
+                .any(|window| window == ["-f", "pulse", "-i", "default"])
+        );
+        assert!(
+            args.windows(4)
+                .any(|window| window == ["-c:a", "aac", "-b:a", "128k"])
+        );
+        assert!(args.iter().any(|arg| arg == "-shortest"));
+        assert!(!args.iter().any(|arg| arg == "-an"));
+    }
+
+    #[test]
+    fn recording_args_allow_disabling_audio() {
+        let config = Config {
+            audio: false,
+            ..Config::default()
+        };
+        let args = recording_ffmpeg_args(&config, Path::new("/tmp/camilo.mp4"), "1920x1080", "30");
+
+        assert!(args.iter().any(|arg| arg == "-an"));
+        assert!(
+            !args
+                .windows(4)
+                .any(|window| window == ["-f", "pulse", "-i", "default"])
+        );
+        assert!(!args.iter().any(|arg| arg == "-c:a"));
+    }
+
+    #[test]
+    fn recording_args_accept_explicit_audio_backend_prefix() {
+        let config = Config {
+            audio_input: "alsa:hw:0".to_string(),
+            ..Config::default()
+        };
+        let args = recording_ffmpeg_args(&config, Path::new("/tmp/camilo.mp4"), "1920x1080", "30");
+
+        assert!(
+            args.windows(4)
+                .any(|window| window == ["-f", "alsa", "-i", "hw:0"])
+        );
     }
 
     #[test]

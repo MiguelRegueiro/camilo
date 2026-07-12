@@ -6,6 +6,7 @@ pub(crate) const DEFAULT_WIDTH: u32 = 1920;
 pub(crate) const DEFAULT_HEIGHT: u32 = 1080;
 pub(crate) const DEFAULT_FPS: u32 = 30;
 pub(crate) const DEFAULT_DEVICE: &str = "/dev/video0";
+pub(crate) const DEFAULT_AUDIO_INPUT: &str = "default";
 
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
@@ -17,6 +18,8 @@ pub(crate) struct Config {
     pub(crate) force: bool,
     pub(crate) mirror_horizontal: bool,
     pub(crate) camera_dir: PathBuf,
+    pub(crate) audio: bool,
+    pub(crate) audio_input: String,
 }
 
 impl Default for Config {
@@ -30,6 +33,8 @@ impl Default for Config {
             force: false,
             mirror_horizontal: false,
             camera_dir: default_camera_dir(),
+            audio: true,
+            audio_input: DEFAULT_AUDIO_INPUT.to_string(),
         }
     }
 }
@@ -85,6 +90,8 @@ fn apply_config_text(config: &mut Config, text: &str) -> Result<()> {
                 config.mirror_horizontal = parse_config_bool(value, line_number, key)?;
             }
             "camera_dir" => config.camera_dir = parse_config_path(value, line_number, key)?,
+            "audio" => config.audio = parse_config_bool(value, line_number, key)?,
+            "audio_input" => config.audio_input = parse_config_string(value, line_number, key)?,
             "" => bail!("line {line_number}: empty config key"),
             _ => bail!("line {line_number}: unknown config key `{key}`"),
         }
@@ -189,6 +196,8 @@ mod tests {
                 height = 450
                 fps = 60
                 camera_dir = "/tmp/camera"
+                audio = false
+                audio_input = "pulse:alsa_input.usb-Test_Mic"
             "#,
         )
         .expect("config file should parse");
@@ -198,6 +207,8 @@ mod tests {
         assert_eq!(config.height, 450);
         assert_eq!(config.fps, 60);
         assert_eq!(config.camera_dir, PathBuf::from("/tmp/camera"));
+        assert!(!config.audio);
+        assert_eq!(config.audio_input, "pulse:alsa_input.usb-Test_Mic");
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub(crate) fn run() -> Result<()> {
 
     if !config.force && !looks_like_kitty() {
         bail!(
-            "this first version targets Kitty graphics; run from kitty or pass --force if your terminal is compatible"
+            "Camilo currently targets Kitty graphics; run from kitty or pass --force if your terminal is compatible"
         );
     }
 

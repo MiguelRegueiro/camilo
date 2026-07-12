@@ -2,7 +2,7 @@
 
 Camera app for the terminal.
 
-Camilo uses `ffmpeg` for camera input and the Kitty graphics protocol for the live preview, shutter controls, photo capture, and video recording.
+Camilo uses direct V4L2 preview when available, `ffmpeg` as fallback/encoder, and the Kitty graphics protocol for the live preview, shutter controls, photo capture, and video recording.
 
 ## Terminal Compatibility
 
@@ -19,7 +19,7 @@ cargo run --release
 Useful options:
 
 ```sh
-cargo run --release -- --device /dev/video0 --width 1920 --height 1080 --fps 30
+cargo run --release -- --device /dev/video0 --width 1920 --height 1080 --fps 30 --preview-backend auto
 ```
 
 ## Config
@@ -32,6 +32,7 @@ camera_dir = "~/Pictures/Camera"
 # width = 1920
 # height = 1080
 # fps = 30
+# preview_backend = "auto" # auto | v4l2 | ffmpeg
 # audio = true
 # audio_input = "default"
 ```
@@ -54,4 +55,4 @@ cargo run --release -- --no-audio
 - Use the right-side mode switch to toggle photo/video mode.
 - Press `q` to quit.
 
-Linux and FreeBSD both use the `v4l2` ffmpeg input. On FreeBSD, that expects a webcam exposed by `webcamd`, usually as `/dev/video0`.
+Linux and FreeBSD both use V4L2 devices. `preview_backend = "auto"` tries direct V4L2 preview first and falls back to `ffmpeg`; use `"ffmpeg"` to force the old path or `"v4l2"` to test direct capture only. On FreeBSD, V4L2 expects a webcam exposed by `webcamd`, usually as `/dev/video0`.

@@ -8,6 +8,24 @@ pub(crate) const DEFAULT_FPS: u32 = 30;
 pub(crate) const DEFAULT_DEVICE: &str = "/dev/video0";
 pub(crate) const DEFAULT_AUDIO_INPUT: &str = "default";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreviewBackend {
+    Auto,
+    V4l2,
+    Ffmpeg,
+}
+
+impl PreviewBackend {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "v4l2" => Some(Self::V4l2),
+            "ffmpeg" => Some(Self::Ffmpeg),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
     pub(crate) device: String,
@@ -15,6 +33,7 @@ pub(crate) struct Config {
     pub(crate) height: u32,
     pub(crate) fps: u32,
     pub(crate) input_format: Option<String>,
+    pub(crate) preview_backend: PreviewBackend,
     pub(crate) force: bool,
     pub(crate) mirror_horizontal: bool,
     pub(crate) camera_dir: PathBuf,
@@ -30,6 +49,7 @@ impl Default for Config {
             height: DEFAULT_HEIGHT,
             fps: DEFAULT_FPS,
             input_format: None,
+            preview_backend: PreviewBackend::Auto,
             force: false,
             mirror_horizontal: false,
             camera_dir: default_camera_dir(),
@@ -85,6 +105,9 @@ fn apply_config_text(config: &mut Config, text: &str) -> Result<()> {
             "width" => config.width = parse_config_u32(value, line_number, key)?,
             "height" => config.height = parse_config_u32(value, line_number, key)?,
             "fps" => config.fps = parse_config_u32(value, line_number, key)?,
+            "preview_backend" => {
+                config.preview_backend = parse_preview_backend(value, line_number, key)?;
+            }
             "force" => config.force = parse_config_bool(value, line_number, key)?,
             "mirror_horizontal" => {
                 config.mirror_horizontal = parse_config_bool(value, line_number, key)?;
@@ -120,6 +143,12 @@ fn parse_config_path(value: &str, line_number: usize, key: &str) -> Result<PathB
         line_number,
         key,
     )?))
+}
+
+fn parse_preview_backend(value: &str, line_number: usize, key: &str) -> Result<PreviewBackend> {
+    let value = parse_config_string(value, line_number, key)?;
+    PreviewBackend::parse(&value)
+        .ok_or_else(|| anyhow!("line {line_number}: `{key}` expects auto, v4l2, or ffmpeg"))
 }
 
 fn parse_config_u32(value: &str, line_number: usize, key: &str) -> Result<u32> {
@@ -195,6 +224,7 @@ mod tests {
                 width = 800
                 height = 450
                 fps = 60
+                preview_backend = "v4l2"
                 camera_dir = "/tmp/camera"
                 audio = false
                 audio_input = "pulse:alsa_input.usb-Test_Mic"
@@ -206,6 +236,7 @@ mod tests {
         assert_eq!(config.width, 800);
         assert_eq!(config.height, 450);
         assert_eq!(config.fps, 60);
+        assert_eq!(config.preview_backend, PreviewBackend::V4l2);
         assert_eq!(config.camera_dir, PathBuf::from("/tmp/camera"));
         assert!(!config.audio);
         assert_eq!(config.audio_input, "pulse:alsa_input.usb-Test_Mic");

@@ -2,7 +2,7 @@ use std::env;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::config::{Config, expand_home_path};
+use crate::config::{Config, PreviewBackend, expand_home_path};
 
 pub(crate) fn config_from_env() -> Result<Config> {
     parse_args(env::args().skip(1))
@@ -40,6 +40,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Config> {
                     .ok_or_else(|| anyhow!("{arg} requires a directory path"))?;
                 config.camera_dir = expand_home_path(&value);
             }
+            "--preview-backend" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("{arg} requires auto, v4l2, or ffmpeg"))?;
+                config.preview_backend = PreviewBackend::parse(&value)
+                    .ok_or_else(|| anyhow!("{arg} expects auto, v4l2, or ffmpeg"))?;
+            }
             "--force" => config.force = true,
             "--mirror-horizontal" => config.mirror_horizontal = true,
             "--no-audio" => config.audio = false,
@@ -75,7 +82,7 @@ fn print_help() {
 camilo - camera app for the terminal
 
 Usage:
-  camilo [--device /dev/video0] [--width 1920] [--height 1080] [--fps 30] [--camera-dir ~/Pictures/Camera] [--mirror-horizontal] [--audio-input default] [--no-audio] [--force]
+  camilo [--device /dev/video0] [--width 1920] [--height 1080] [--fps 30] [--preview-backend auto|v4l2|ffmpeg] [--camera-dir ~/Pictures/Camera] [--mirror-horizontal] [--audio-input default] [--no-audio] [--force]
 
 Controls:
   Right-side shutter button  take pictures or start/stop video recording
@@ -95,6 +102,23 @@ mod tests {
             .expect("high preview fps should be accepted");
 
         assert_eq!(config.fps, 240);
+    }
+
+    #[test]
+    fn preview_backend_cli_overrides_config() {
+        let config =
+            parse_args(["--preview-backend".to_string(), "ffmpeg".to_string()].into_iter())
+                .expect("preview backend should parse");
+
+        assert_eq!(config.preview_backend, PreviewBackend::Ffmpeg);
+    }
+
+    #[test]
+    fn preview_backend_cli_rejects_unknown_values() {
+        let error = parse_args(["--preview-backend".to_string(), "native".to_string()].into_iter())
+            .expect_err("unknown preview backend should fail");
+
+        assert!(error.to_string().contains("expects auto, v4l2, or ffmpeg"));
     }
 
     #[test]

@@ -469,6 +469,10 @@ impl VideoRecording {
         }
     }
 
+    pub(crate) fn stop_async(self) -> thread::JoinHandle<Result<()>> {
+        thread::spawn(move || self.stop())
+    }
+
     pub(crate) fn stop(mut self) -> Result<()> {
         drop(self.stdin.take());
         let status = self

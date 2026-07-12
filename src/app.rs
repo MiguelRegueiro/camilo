@@ -32,6 +32,10 @@ struct ActiveRecording {
     last_timer_second: Option<u64>,
 }
 
+struct PendingRecordingStop {
+    handle: thread::JoinHandle<Result<()>>,
+}
+
 pub(crate) fn run() -> Result<()> {
     let mut config = cli::config_from_env()?;
     apply_best_camera_mode(&mut config);
@@ -80,11 +84,14 @@ pub(crate) fn run() -> Result<()> {
     let mut next_thumbnail_rescan = Instant::now() + Duration::from_millis(750);
     let mut capture_requested = false;
     let mut recording: Option<ActiveRecording> = None;
+    let mut pending_recording_stops = Vec::<PendingRecordingStop>::new();
     let mut no_mic_visible = false;
     let audio_available = audio_input_available(&config);
     let mut have_frame = false;
 
     loop {
+        collect_finished_recordings(&mut pending_recording_stops)?;
+
         if drain_input_events(
             &stop_rx,
             last_layout,
@@ -181,7 +188,9 @@ pub(crate) fn run() -> Result<()> {
                 }
                 CaptureMode::Video => {
                     if let Some(recording) = recording.take() {
-                        recording.encoder.stop()?;
+                        pending_recording_stops.push(PendingRecordingStop {
+                            handle: recording.encoder.stop_async(),
+                        });
                         write_kitty_delete_image(&mut out, KITTY_TIMER_IMAGE_ID)?;
                         if no_mic_visible {
                             write_kitty_delete_image(&mut out, KITTY_NO_MIC_IMAGE_ID)?;
@@ -301,8 +310,36 @@ pub(crate) fn run() -> Result<()> {
         recording.encoder.stop()?;
     }
     camera.stop();
+    wait_for_recording_stops(pending_recording_stops)?;
 
     Ok(())
+}
+
+fn collect_finished_recordings(recordings: &mut Vec<PendingRecordingStop>) -> Result<()> {
+    let mut index = 0;
+    while index < recordings.len() {
+        if recordings[index].handle.is_finished() {
+            let recording = recordings.swap_remove(index);
+            finish_recording_stop(recording)?;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_recording_stops(recordings: Vec<PendingRecordingStop>) -> Result<()> {
+    for recording in recordings {
+        finish_recording_stop(recording)?;
+    }
+    Ok(())
+}
+
+fn finish_recording_stop(recording: PendingRecordingStop) -> Result<()> {
+    recording
+        .handle
+        .join()
+        .unwrap_or_else(|_| bail!("video recording finalizer panicked"))
 }
 
 fn write_due_recording_frames(

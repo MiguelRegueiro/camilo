@@ -536,6 +536,46 @@ fn mark_camera_stream_error(state: &Arc<Mutex<LatestCameraFrame>>, error: io::Er
     }
 }
 
+fn camera_stream_ffmpeg_args(config: &Config) -> Vec<String> {
+    let video_filter = ffmpeg_video_filter(config);
+    let input_size = format!("{}x{}", config.width, config.height);
+    let framerate = config.fps.to_string();
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-nostdin".to_string(),
+        "-fflags".to_string(),
+        "nobuffer".to_string(),
+        "-flags".to_string(),
+        "low_delay".to_string(),
+        "-f".to_string(),
+        "v4l2".to_string(),
+    ];
+    add_input_format_args(&mut args, config);
+    args.extend([
+        "-thread_queue_size".to_string(),
+        "1".to_string(),
+        "-framerate".to_string(),
+        framerate,
+        "-video_size".to_string(),
+        input_size,
+        "-i".to_string(),
+        config.device.clone(),
+        "-an".to_string(),
+        "-sn".to_string(),
+        "-dn".to_string(),
+        "-vf".to_string(),
+        video_filter,
+        "-pix_fmt".to_string(),
+        "rgb24".to_string(),
+        "-f".to_string(),
+        "rawvideo".to_string(),
+        "pipe:1".to_string(),
+    ]);
+    args
+}
+
 pub(crate) struct CameraStream {
     child: Child,
     latest_frame: Arc<Mutex<LatestCameraFrame>>,
@@ -547,41 +587,7 @@ pub(crate) struct CameraStream {
 
 impl CameraStream {
     pub(crate) fn spawn(config: &Config) -> Result<Self> {
-        let video_filter = ffmpeg_video_filter(config);
-        let input_size = format!("{}x{}", config.width, config.height);
-        let framerate = config.fps.to_string();
-
-        let mut args = vec![
-            "-hide_banner".to_string(),
-            "-loglevel".to_string(),
-            "error".to_string(),
-            "-nostdin".to_string(),
-            "-fflags".to_string(),
-            "nobuffer".to_string(),
-            "-flags".to_string(),
-            "low_delay".to_string(),
-            "-f".to_string(),
-            "v4l2".to_string(),
-        ];
-        add_input_format_args(&mut args, config);
-        args.extend([
-            "-framerate".to_string(),
-            framerate,
-            "-video_size".to_string(),
-            input_size,
-            "-i".to_string(),
-            config.device.clone(),
-            "-an".to_string(),
-            "-sn".to_string(),
-            "-dn".to_string(),
-            "-vf".to_string(),
-            video_filter,
-            "-pix_fmt".to_string(),
-            "rgb24".to_string(),
-            "-f".to_string(),
-            "rawvideo".to_string(),
-            "pipe:1".to_string(),
-        ]);
+        let args = camera_stream_ffmpeg_args(config);
 
         let mut child = Command::new("ffmpeg")
             .args(args)
@@ -695,8 +701,8 @@ fn ffmpeg_video_filter(config: &Config) -> String {
         ""
     };
     format!(
-        "{mirror}scale={}:{}:force_original_aspect_ratio=increase,crop={}:{}:(iw-ow)/2:(ih-oh)/2,fps={},format=rgb24",
-        config.width, config.height, config.width, config.height, config.fps
+        "{mirror}scale={}:{}:force_original_aspect_ratio=increase,crop={}:{}:(iw-ow)/2:(ih-oh)/2,format=rgb24",
+        config.width, config.height, config.width, config.height
     )
 }
 
@@ -721,6 +727,23 @@ mod tests {
     }
 
     #[test]
+    fn camera_stream_args_cap_input_queue_before_device() {
+        let config = Config::default();
+        let args = camera_stream_ffmpeg_args(&config);
+        let queue_index = args
+            .iter()
+            .position(|arg| arg == "-thread_queue_size")
+            .expect("input queue should be capped");
+        let input_index = args
+            .iter()
+            .position(|arg| arg == "-i")
+            .expect("camera input should be present");
+
+        assert_eq!(args.get(queue_index + 1).map(String::as_str), Some("1"));
+        assert!(queue_index < input_index);
+    }
+
+    #[test]
     fn ffmpeg_filter_adds_hflip_when_horizontal_mirror_is_enabled() {
         let mut config = Config::default();
 
@@ -730,6 +753,7 @@ mod tests {
         let filter = ffmpeg_video_filter(&config);
         assert!(filter.starts_with("hflip,scale="));
         assert!(filter.contains("force_original_aspect_ratio=increase,crop="));
+        assert!(!filter.contains("fps="));
     }
 
     #[test]

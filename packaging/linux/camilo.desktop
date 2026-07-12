@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=camilo
+Comment=Camera app for the terminal
+Icon=camilo
+TryExec=camilo
+Exec=camilo
+Terminal=true
+Categories=AudioVideo;Video;Recorder;ConsoleOnly;
+Keywords=Camera;Webcam;Photo;Video;Terminal;TUI;

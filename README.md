@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" width="160" alt="camilo logo">
+</p>
+
 # camilo
 
 Camera app for the terminal.

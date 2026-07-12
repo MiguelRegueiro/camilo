@@ -1242,10 +1242,18 @@ fn run_v4l2_capture_inner_platform(
         match store_v4l2_next_frame(&mut stream, frame_config, latest_frame, &mut buffer) {
             Ok(reused) => buffer = reused,
             Err(error) if error.kind() == ErrorKind::TimedOut => {}
+            Err(error) if is_transient_v4l2_runtime_read_error(&error) => {
+                thread::sleep(std::time::Duration::from_millis(1));
+            }
             Err(error) => return Err(format!("failed to read v4l2 frame: {error}")),
         }
     }
     Ok(())
+}
+
+#[cfg(not(target_os = "freebsd"))]
+fn is_transient_v4l2_runtime_read_error(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(22)
 }
 
 #[cfg(target_os = "freebsd")]

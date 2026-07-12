@@ -681,11 +681,13 @@ fn no_mic_pill_rgba(width: u32, height: u32) -> Vec<u8> {
         &mut frame,
         width,
         height,
-        (27.0, 33.0),
-        (46.0, 15.0),
-        3.0,
-        [239, 68, 68],
-        245,
+        SoftLine {
+            from: (27.0, 33.0),
+            to: (46.0, 15.0),
+            radius: 3.0,
+            color: [239, 68, 68],
+            alpha: 245,
+        },
     );
     frame
 }
@@ -746,18 +748,17 @@ fn draw_mic_arc(frame: &mut [u8], width: u32, height: u32, center_x: f64, color:
     }
 }
 
-fn draw_soft_line(
-    frame: &mut [u8],
-    width: u32,
-    height: u32,
+struct SoftLine {
     from: (f64, f64),
     to: (f64, f64),
     radius: f64,
     color: [u8; 3],
     alpha: u8,
-) {
-    let (x0, y0) = from;
-    let (x1, y1) = to;
+}
+
+fn draw_soft_line(frame: &mut [u8], width: u32, height: u32, line: SoftLine) {
+    let (x0, y0) = line.from;
+    let (x1, y1) = line.to;
     let dx = x1 - x0;
     let dy = y1 - y0;
     let len_sq = dx * dx + dy * dy;
@@ -772,14 +773,14 @@ fn draw_soft_line(
             let nearest_x = x0 + t * dx;
             let nearest_y = y0 + t * dy;
             let distance = ((px - nearest_x).powi(2) + (py - nearest_y).powi(2)).sqrt();
-            let coverage = (radius - distance).clamp(0.0, 1.0);
+            let coverage = (line.radius - distance).clamp(0.0, 1.0);
             if coverage > 0.0 {
                 let offset = rgba_offset(width, x, y);
                 blend_pixel(
                     frame,
                     offset,
-                    color,
-                    (coverage * f64::from(alpha)).round() as u8,
+                    line.color,
+                    (coverage * f64::from(line.alpha)).round() as u8,
                 );
             }
         }

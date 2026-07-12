@@ -191,13 +191,12 @@ pub(crate) fn run() -> Result<()> {
         }
 
         let image_id = KITTY_IMAGE_IDS[(frame_serial as usize) % KITTY_IMAGE_IDS.len()];
-        let z_index = (frame_serial % 1_000_000_000) as i32;
         write_kitty_rgb_frame(
             &mut out,
             KittyFramePlacement {
                 image_id,
                 placement_id: KITTY_PLACEMENT_ID,
-                z_index,
+                z_index: 0,
                 previous_image_id,
                 width: config.width,
                 height: config.height,

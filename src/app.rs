@@ -43,7 +43,7 @@ pub(crate) fn run() -> Result<()> {
         enable_tmux_passthrough();
     }
 
-    let mut camera = CameraStream::spawn(&config)?;
+    let mut camera = CameraStream::spawn(&mut config)?;
     let frame_len = frame_len(config.width, config.height)?;
     let mut frame = vec![0_u8; frame_len];
 
@@ -240,6 +240,7 @@ pub(crate) fn run() -> Result<()> {
     if let Some(recording) = recording.take() {
         recording.encoder.stop()?;
     }
+    camera.stop();
 
     Ok(())
 }

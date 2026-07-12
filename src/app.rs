@@ -13,6 +13,7 @@ use crate::{
         save_capture, square_thumbnail,
     },
     cli,
+    config::PreviewBackend,
     terminal::{
         CaptureMode, KITTY_IMAGE_IDS, KITTY_PLACEMENT_ID, KITTY_THUMBNAIL_IMAGE_IDS,
         KITTY_THUMBNAIL_PLACEMENT_ID, KITTY_TIMER_IMAGE_ID, KittyFramePlacement, TerminalGuard,
@@ -32,8 +33,11 @@ struct ActiveRecording {
 pub(crate) fn run() -> Result<()> {
     let mut config = cli::config_from_env()?;
     apply_best_camera_mode(&mut config);
+    if config.camera_info && config.preview_backend == PreviewBackend::Auto {
+        config.preview_backend = PreviewBackend::V4l2;
+    }
 
-    if !config.force && !looks_like_kitty() {
+    if !config.camera_info && !config.force && !looks_like_kitty() {
         bail!(
             "Camilo currently targets Kitty graphics; run from kitty or pass --force if your terminal is compatible"
         );
@@ -44,6 +48,16 @@ pub(crate) fn run() -> Result<()> {
     }
 
     let mut camera = CameraStream::spawn(&mut config)?;
+    if config.camera_info {
+        let input_format = config.input_format.as_deref().unwrap_or("unknown");
+        println!(
+            "camera: {} {}x{} {}fps {}",
+            config.device, config.width, config.height, config.fps, input_format
+        );
+        camera.stop();
+        return Ok(());
+    }
+
     let frame_len = frame_len(config.width, config.height)?;
     let mut frame = vec![0_u8; frame_len];
 

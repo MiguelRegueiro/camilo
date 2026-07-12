@@ -34,18 +34,37 @@ pub(crate) fn apply_best_camera_mode(config: &mut Config) {
 }
 
 fn best_camera_mode(device: &str) -> Result<CameraMode> {
-    let output = Command::new("v4l2-ctl")
-        .arg(format!("--device={device}"))
-        .arg("--list-formats-ext")
-        .output()
-        .context("failed to query camera formats with v4l2-ctl")?;
-    if !output.status.success() {
-        bail!("v4l2-ctl failed to query camera formats");
+    use v4l::prelude::*;
+    use v4l::video::Capture;
+
+    let device = Device::with_path(device).context("failed to open v4l2 device")?;
+    let mut modes = Vec::new();
+
+    for format in device.enum_formats()? {
+        let Some(pixel_format) = V4l2PixelFormat::from_fourcc(format.fourcc) else {
+            continue;
+        };
+
+        for frame_size in device.enum_framesizes(format.fourcc)? {
+            for discrete in frame_size.size.to_discrete() {
+                let fps = best_v4l2_fps(&device, format.fourcc, discrete.width, discrete.height);
+                modes.push(CameraMode {
+                    format: pixel_format.fourcc_name().to_string(),
+                    width: discrete.width,
+                    height: discrete.height,
+                    fps,
+                });
+            }
+        }
     }
-    parse_best_camera_mode(&String::from_utf8_lossy(&output.stdout))
+
+    modes
+        .into_iter()
+        .max_by_key(camera_mode_preference)
         .ok_or_else(|| anyhow!("camera did not report usable capture modes"))
 }
 
+#[cfg(test)]
 fn parse_best_camera_mode(text: &str) -> Option<CameraMode> {
     let mut format = None::<String>;
     let mut size = None::<(u32, u32)>;
@@ -73,15 +92,41 @@ fn parse_best_camera_mode(text: &str) -> Option<CameraMode> {
         }
     }
 
-    modes.into_iter().max_by_key(|mode| {
-        (
-            mode.width as u64 * mode.height as u64,
-            mode.fps,
-            u8::from(mode.format == "MJPG"),
-        )
-    })
+    modes.into_iter().max_by_key(camera_mode_preference)
 }
 
+fn camera_mode_preference(mode: &CameraMode) -> (u64, u32, u8) {
+    (
+        mode.width as u64 * mode.height as u64,
+        mode.fps,
+        u8::from(mode.format == "MJPG"),
+    )
+}
+
+fn best_v4l2_fps(device: &v4l::Device, fourcc: v4l::FourCC, width: u32, height: u32) -> u32 {
+    use v4l::frameinterval::FrameIntervalEnum;
+    use v4l::video::Capture;
+
+    device
+        .enum_frameintervals(fourcc, width, height)
+        .ok()
+        .and_then(|intervals| {
+            intervals
+                .into_iter()
+                .filter_map(|interval| match interval.interval {
+                    FrameIntervalEnum::Discrete(fraction) => {
+                        fps_from_interval(fraction.numerator, fraction.denominator)
+                    }
+                    FrameIntervalEnum::Stepwise(stepwise) => {
+                        fps_from_interval(stepwise.min.numerator, stepwise.min.denominator)
+                    }
+                })
+                .max()
+        })
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
 fn parse_interval_fps(interval: &str) -> Option<u32> {
     let fps = interval
         .split_once('(')
@@ -99,8 +144,17 @@ fn ffmpeg_input_format(format: &str) -> &str {
     match format {
         "MJPG" => "mjpeg",
         "YUYV" => "yuyv422",
+        "RGB3" => "rgb24",
         other => other,
     }
+}
+
+fn fps_from_interval(numerator: u32, denominator: u32) -> Option<u32> {
+    (numerator > 0 && denominator > 0).then(|| {
+        (f64::from(denominator) / f64::from(numerator))
+            .round()
+            .clamp(1.0, 120.0) as u32
+    })
 }
 
 fn add_input_format_args(args: &mut Vec<String>, config: &Config) {
@@ -835,6 +889,14 @@ impl V4l2PixelFormat {
         }
     }
 
+    fn fourcc_name(self) -> &'static str {
+        match self {
+            Self::Rgb24 => "RGB3",
+            Self::Yuyv => "YUYV",
+            Self::Mjpeg => "MJPG",
+        }
+    }
+
     fn input_format(self) -> &'static str {
         match self {
             Self::Rgb24 => "rgb24",
@@ -874,8 +936,8 @@ fn preferred_v4l2_formats(config: &Config) -> Vec<V4l2PixelFormat> {
         }
     }
     for format in [
-        V4l2PixelFormat::Yuyv,
         V4l2PixelFormat::Mjpeg,
+        V4l2PixelFormat::Yuyv,
         V4l2PixelFormat::Rgb24,
     ] {
         if !formats.contains(&format) {
@@ -1211,6 +1273,20 @@ mod tests {
                 V4l2PixelFormat::Mjpeg,
                 V4l2PixelFormat::Yuyv,
                 V4l2PixelFormat::Rgb24,
+            ]
+        );
+    }
+
+    #[test]
+    fn v4l2_format_preference_tries_mjpeg_before_yuyv_without_probe() {
+        let config = Config::default();
+
+        assert_eq!(
+            preferred_v4l2_formats(&config),
+            vec![
+                V4l2PixelFormat::Mjpeg,
+                V4l2PixelFormat::Yuyv,
+                V4l2PixelFormat::Rgb24
             ]
         );
     }

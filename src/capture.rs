@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{self, ErrorKind, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStderr, ChildStdin, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -494,9 +494,54 @@ fn read_stderr_async(stderr_pipe: ChildStderr) -> (Arc<Mutex<String>>, thread::J
     (stderr, stderr_thread)
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum CameraFrameStatus {
+    NewFrame,
+    NoFrame,
+    Ended,
+}
+
+#[derive(Default)]
+struct LatestCameraFrame {
+    frame: Option<Vec<u8>>,
+    ended: bool,
+    error: Option<String>,
+    serial: u64,
+}
+
+fn store_latest_frame(
+    state: &Arc<Mutex<LatestCameraFrame>>,
+    frame: Vec<u8>,
+    frame_len: usize,
+) -> Vec<u8> {
+    let old_frame = if let Ok(mut state) = state.lock() {
+        let old_frame = state.frame.replace(frame);
+        state.serial = state.serial.wrapping_add(1);
+        old_frame
+    } else {
+        None
+    };
+    old_frame.unwrap_or_else(|| vec![0_u8; frame_len])
+}
+
+fn mark_camera_stream_ended(state: &Arc<Mutex<LatestCameraFrame>>) {
+    if let Ok(mut state) = state.lock() {
+        state.ended = true;
+    }
+}
+
+fn mark_camera_stream_error(state: &Arc<Mutex<LatestCameraFrame>>, error: io::Error) {
+    if let Ok(mut state) = state.lock() {
+        state.error = Some(error.to_string());
+        state.ended = true;
+    }
+}
+
 pub(crate) struct CameraStream {
     child: Child,
-    stdout: ChildStdout,
+    latest_frame: Arc<Mutex<LatestCameraFrame>>,
+    delivered_serial: u64,
+    frame_thread: Option<thread::JoinHandle<()>>,
     stderr: Arc<Mutex<String>>,
     stderr_thread: Option<thread::JoinHandle<()>>,
 }
@@ -547,7 +592,7 @@ impl CameraStream {
             .spawn()
             .context("failed to start ffmpeg; is it installed and in PATH?")?;
 
-        let stdout = child
+        let mut stdout = child
             .stdout
             .take()
             .ok_or_else(|| anyhow!("failed to capture ffmpeg stdout"))?;
@@ -556,20 +601,66 @@ impl CameraStream {
             .take()
             .ok_or_else(|| anyhow!("failed to capture ffmpeg stderr"))?;
         let (stderr, stderr_thread) = read_stderr_async(stderr_pipe);
+        let frame_len = frame_len(config.width, config.height)?;
+        let latest_frame = Arc::new(Mutex::new(LatestCameraFrame::default()));
+        let frame_target = Arc::clone(&latest_frame);
+        let frame_thread = thread::spawn(move || {
+            let mut buffer = vec![0_u8; frame_len];
+            loop {
+                match stdout.read_exact(&mut buffer) {
+                    Ok(()) => {
+                        buffer = store_latest_frame(&frame_target, buffer, frame_len);
+                    }
+                    Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                        mark_camera_stream_ended(&frame_target);
+                        break;
+                    }
+                    Err(error) => {
+                        mark_camera_stream_error(&frame_target, error);
+                        break;
+                    }
+                }
+            }
+        });
 
         Ok(Self {
             child,
-            stdout,
+            latest_frame,
+            delivered_serial: 0,
+            frame_thread: Some(frame_thread),
             stderr,
             stderr_thread: Some(stderr_thread),
         })
     }
 
-    pub(crate) fn read_frame(&mut self, frame: &mut [u8]) -> io::Result<bool> {
-        match self.stdout.read_exact(frame) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => Ok(false),
-            Err(error) => Err(error),
+    pub(crate) fn read_latest_frame(&mut self, frame: &mut [u8]) -> io::Result<CameraFrameStatus> {
+        let mut state = self
+            .latest_frame
+            .lock()
+            .map_err(|_| io::Error::other("camera frame state is poisoned"))?;
+        if state.serial != self.delivered_serial {
+            let Some(latest_frame) = state.frame.as_ref() else {
+                return Ok(CameraFrameStatus::NoFrame);
+            };
+            if latest_frame.len() != frame.len() {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "camera frame has {} bytes, expected {}",
+                        latest_frame.len(),
+                        frame.len()
+                    ),
+                ));
+            }
+            frame.copy_from_slice(latest_frame);
+            self.delivered_serial = state.serial;
+            Ok(CameraFrameStatus::NewFrame)
+        } else if let Some(error) = state.error.take() {
+            Err(io::Error::other(error))
+        } else if state.ended {
+            Ok(CameraFrameStatus::Ended)
+        } else {
+            Ok(CameraFrameStatus::NoFrame)
         }
     }
 
@@ -583,6 +674,9 @@ impl CameraStream {
     pub(crate) fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(handle) = self.frame_thread.take() {
+            let _ = handle.join();
+        }
         if let Some(handle) = self.stderr_thread.take() {
             let _ = handle.join();
         }
@@ -612,6 +706,20 @@ mod tests {
     use std::{env, fs, thread, time::SystemTime};
 
     use super::*;
+
+    #[test]
+    fn latest_frame_store_keeps_only_newest_frame() {
+        let state = Arc::new(Mutex::new(LatestCameraFrame::default()));
+        let reused = store_latest_frame(&state, vec![1, 1, 1], 3);
+        assert_eq!(reused, vec![0, 0, 0]);
+
+        let reused = store_latest_frame(&state, vec![2, 2, 2], 3);
+        assert_eq!(reused, vec![1, 1, 1]);
+
+        let state = state.lock().expect("state should lock");
+        assert_eq!(state.frame, Some(vec![2, 2, 2]));
+        assert_eq!(state.serial, 2);
+    }
 
     #[test]
     fn ffmpeg_filter_adds_hflip_when_horizontal_mirror_is_enabled() {

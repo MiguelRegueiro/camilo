@@ -1,5 +1,6 @@
 use std::{
     io::{self, BufWriter, Write},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -7,8 +8,9 @@ use anyhow::{Result, bail};
 
 use crate::{
     capture::{
-        CameraStream, CaptureThumbnail, THUMBNAIL_SIZE, VideoRecording, apply_best_camera_mode,
-        frame_len, latest_capture_thumbnail, latest_image_path, save_capture, square_thumbnail,
+        CameraFrameStatus, CameraStream, CaptureThumbnail, THUMBNAIL_SIZE, VideoRecording,
+        apply_best_camera_mode, frame_len, latest_capture_thumbnail, latest_image_path,
+        save_capture, square_thumbnail,
     },
     cli,
     terminal::{
@@ -75,9 +77,13 @@ pub(crate) fn run() -> Result<()> {
             break;
         }
 
-        match camera.read_frame(&mut frame) {
-            Ok(true) => {}
-            Ok(false) => {
+        match camera.read_latest_frame(&mut frame) {
+            Ok(CameraFrameStatus::NewFrame) => {}
+            Ok(CameraFrameStatus::NoFrame) => {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            Ok(CameraFrameStatus::Ended) => {
                 camera.stop();
                 let stderr = camera.stderr_text();
                 if stderr.trim().is_empty() {

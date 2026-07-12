@@ -11,8 +11,10 @@ anyhow = "1.0"
 base64 = "0.22"
 crossterm = "0.29"
 libc = "0.2"
-v4l = "0.14.0"
 zune-jpeg = "0.5.15"
+
+[target.'cfg(not(target_os = "freebsd"))'.dependencies]
+v4l = "0.14.0"
 
 [profile.release]
 strip = true

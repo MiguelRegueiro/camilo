@@ -28,11 +28,13 @@ pub(crate) const KITTY_THUMBNAIL_IMAGE_IDS: [u32; 2] = [KITTY_IMAGE_ID + 10, KIT
 pub(crate) const KITTY_SHUTTER_IMAGE_ID: u32 = KITTY_IMAGE_ID + 20;
 pub(crate) const KITTY_MODE_IMAGE_ID: u32 = KITTY_IMAGE_ID + 30;
 pub(crate) const KITTY_TIMER_IMAGE_ID: u32 = KITTY_IMAGE_ID + 40;
+pub(crate) const KITTY_NO_MIC_IMAGE_ID: u32 = KITTY_IMAGE_ID + 50;
 pub(crate) const KITTY_PLACEMENT_ID: u32 = 1;
 pub(crate) const KITTY_THUMBNAIL_PLACEMENT_ID: u32 = 2;
 pub(crate) const KITTY_SHUTTER_PLACEMENT_ID: u32 = 3;
 pub(crate) const KITTY_MODE_PLACEMENT_ID: u32 = 4;
 pub(crate) const KITTY_TIMER_PLACEMENT_ID: u32 = 5;
+pub(crate) const KITTY_NO_MIC_PLACEMENT_ID: u32 = 6;
 const KITTY_RAW_CHUNK_BYTES: usize = 3 * 4096 / 4;
 const SIDEBAR_COLS: u16 = 16;
 const MIN_PREVIEW_COLS: u16 = 20;
@@ -42,9 +44,12 @@ const MODE_PILL_WIDTH: u32 = 128;
 const MODE_PILL_HEIGHT: u32 = 160;
 const RECORDING_TIMER_WIDTH: u32 = 224;
 const RECORDING_TIMER_HEIGHT: u32 = 48;
+const NO_MIC_PILL_WIDTH: u32 = 72;
+const NO_MIC_PILL_HEIGHT: u32 = 48;
 const SHUTTER_Z_INDEX: i32 = 1_000_000_001;
 const MODE_PILL_Z_INDEX: i32 = 1_000_000_002;
 const TIMER_Z_INDEX: i32 = 1_000_000_003;
+const NO_MIC_Z_INDEX: i32 = 1_000_000_004;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Rect {
@@ -80,6 +85,7 @@ pub(crate) struct UiLayout {
     pub(crate) mode_toggle: Option<Rect>,
     pub(crate) mode_pill_area: Option<ImageArea>,
     pub(crate) recording_timer_area: Option<ImageArea>,
+    pub(crate) no_mic_area: Option<ImageArea>,
     pub(crate) thumbnail_area: Option<ImageArea>,
 }
 
@@ -257,6 +263,7 @@ pub(crate) fn ui_layout(source_width: u32, source_height: u32) -> UiLayout {
     let capture_button = shutter_area.map(capture_hitbox);
     let (mode_toggle, mode_pill_area) = mode_pill_area(sidebar);
     let recording_timer_area = recording_timer_area(preview_bounds);
+    let no_mic_area = no_mic_area(preview_bounds);
     let thumbnail_area = thumbnail_area(sidebar, rows, cell_width, cell_height);
 
     UiLayout {
@@ -273,6 +280,7 @@ pub(crate) fn ui_layout(source_width: u32, source_height: u32) -> UiLayout {
         mode_toggle,
         mode_pill_area,
         recording_timer_area,
+        no_mic_area,
         thumbnail_area,
     }
 }
@@ -347,6 +355,20 @@ fn recording_timer_area(preview: Rect) -> Option<ImageArea> {
         y: rect.y,
         cols: rect.cols,
         rows: rect.rows,
+    })
+}
+
+fn no_mic_area(preview: Rect) -> Option<ImageArea> {
+    if preview.cols < 10 || preview.rows < 4 {
+        return None;
+    }
+
+    let cols = 5.min(preview.cols.saturating_sub(2));
+    Some(ImageArea {
+        x: preview.x + preview.cols.saturating_sub(cols + 1),
+        y: preview.y + 1,
+        cols,
+        rows: 3,
     })
 }
 
@@ -577,6 +599,29 @@ pub(crate) fn write_kitty_recording_timer(
     )
 }
 
+pub(crate) fn write_kitty_no_mic_pill(
+    out: &mut impl Write,
+    area: ImageArea,
+    sequence: &mut Vec<u8>,
+) -> io::Result<()> {
+    let frame = no_mic_pill_rgba(NO_MIC_PILL_WIDTH, NO_MIC_PILL_HEIGHT);
+    write_kitty_image(
+        out,
+        KittyFramePlacement {
+            image_id: KITTY_NO_MIC_IMAGE_ID,
+            placement_id: KITTY_NO_MIC_PLACEMENT_ID,
+            z_index: NO_MIC_Z_INDEX,
+            previous_image_id: None,
+            width: NO_MIC_PILL_WIDTH,
+            height: NO_MIC_PILL_HEIGHT,
+            area,
+        },
+        &frame,
+        32,
+        sequence,
+    )
+}
+
 fn recording_timer_rgba(width: u32, height: u32, elapsed: std::time::Duration) -> Vec<u8> {
     let mut frame = vec![0_u8; (width * height * 4) as usize];
     fill_rounded_rect(
@@ -613,6 +658,132 @@ fn recording_timer_rgba(width: u32, height: u32, elapsed: std::time::Duration) -
     let text = format!("{minutes:02}:{seconds:02}");
     draw_timer_text(&mut frame, width, height, 72, 11, &text);
     frame
+}
+
+fn no_mic_pill_rgba(width: u32, height: u32) -> Vec<u8> {
+    let mut frame = vec![0_u8; (width * height * 4) as usize];
+    fill_rounded_rect(
+        &mut frame,
+        width,
+        height,
+        RoundedRect {
+            x: 8.0,
+            y: 5.0,
+            width: f64::from(width - 16),
+            height: f64::from(height - 10),
+            radius: 18.0,
+        },
+        [24, 24, 27],
+        176,
+    );
+    draw_mic_glyph(&mut frame, width, height, [250, 250, 250]);
+    draw_soft_line(
+        &mut frame,
+        width,
+        height,
+        (27.0, 33.0),
+        (46.0, 15.0),
+        3.0,
+        [239, 68, 68],
+        245,
+    );
+    frame
+}
+
+fn draw_mic_glyph(frame: &mut [u8], width: u32, height: u32, color: [u8; 3]) {
+    let center_x = f64::from(width) / 2.0;
+    fill_rounded_rect(
+        frame,
+        width,
+        height,
+        RoundedRect {
+            x: center_x - 6.5,
+            y: 12.0,
+            width: 13.0,
+            height: 15.0,
+            radius: 6.5,
+        },
+        color,
+        238,
+    );
+    draw_mic_arc(frame, width, height, center_x, color);
+    fill_rounded_rect(
+        frame,
+        width,
+        height,
+        RoundedRect {
+            x: center_x - 1.75,
+            y: 30.0,
+            width: 3.5,
+            height: 4.0,
+            radius: 2.0,
+        },
+        color,
+        238,
+    );
+}
+
+fn draw_mic_arc(frame: &mut [u8], width: u32, height: u32, center_x: f64, color: [u8; 3]) {
+    let center_y = 23.0;
+    let radius_x = 11.0;
+    let radius_y = 6.5;
+    for y in 0..height {
+        for x in 0..width {
+            let px = f64::from(x) + 0.5;
+            let py = f64::from(y) + 0.5;
+            let dx = (px - center_x) / radius_x;
+            let dy = (py - center_y) / radius_y;
+            if py < center_y || py > center_y + radius_y + 1.0 {
+                continue;
+            }
+            let distance = (dx * dx + dy * dy).sqrt();
+            let coverage = (1.65 - (distance - 1.0).abs() * radius_x.min(radius_y)).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                let offset = rgba_offset(width, x, y);
+                blend_pixel(frame, offset, color, (coverage * 220.0).round() as u8);
+            }
+        }
+    }
+}
+
+fn draw_soft_line(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    from: (f64, f64),
+    to: (f64, f64),
+    radius: f64,
+    color: [u8; 3],
+    alpha: u8,
+) {
+    let (x0, y0) = from;
+    let (x1, y1) = to;
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq == 0.0 {
+        return;
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let px = f64::from(x) + 0.5;
+            let py = f64::from(y) + 0.5;
+            let t = (((px - x0) * dx + (py - y0) * dy) / len_sq).clamp(0.0, 1.0);
+            let nearest_x = x0 + t * dx;
+            let nearest_y = y0 + t * dy;
+            let distance = ((px - nearest_x).powi(2) + (py - nearest_y).powi(2)).sqrt();
+            let coverage = (radius - distance).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                let offset = rgba_offset(width, x, y);
+                blend_pixel(
+                    frame,
+                    offset,
+                    color,
+                    (coverage * f64::from(alpha)).round() as u8,
+                );
+            }
+        }
+    }
 }
 
 fn draw_timer_text(frame: &mut [u8], width: u32, height: u32, x: u32, y: u32, text: &str) {
@@ -1353,6 +1524,26 @@ mod tests {
     }
 
     #[test]
+    fn no_mic_pill_uses_transparent_rgba_kitty_image() {
+        let area = ImageArea {
+            x: 3,
+            y: 1,
+            cols: 5,
+            rows: 3,
+        };
+        let mut out = Vec::new();
+        let mut scratch = Vec::new();
+
+        write_kitty_no_mic_pill(&mut out, area, &mut scratch).expect("no mic pill should encode");
+
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("\x1b[2;4H"));
+        assert!(text.contains("a=T,q=2,f=32,s=72,v=48"));
+        assert!(text.contains(&format!("i={KITTY_NO_MIC_IMAGE_ID}")));
+        assert!(text.contains(&format!("p={KITTY_NO_MIC_PLACEMENT_ID}")));
+    }
+
+    #[test]
     fn capture_hitbox_matches_shutter_image_area() {
         let area = ImageArea {
             x: 18,
@@ -1401,6 +1592,7 @@ mod tests {
             }),
             mode_pill_area: None,
             recording_timer_area: None,
+            no_mic_area: None,
             thumbnail_area: None,
         };
 

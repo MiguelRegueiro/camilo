@@ -8,19 +8,19 @@ use anyhow::{Result, bail};
 
 use crate::{
     capture::{
-        CameraFrameStatus, CameraStream, CaptureThumbnail, THUMBNAIL_SIZE, VideoRecording,
-        apply_best_camera_mode, frame_len, latest_capture_thumbnail, latest_image_path,
-        save_capture, square_thumbnail,
+        CameraFrameStatus, CameraStream, CaptureThumbnail, RecordingWriteStatus, THUMBNAIL_SIZE,
+        VideoRecording, apply_best_camera_mode, audio_input_available, frame_len,
+        latest_capture_thumbnail, latest_image_path, save_capture, square_thumbnail,
     },
     cli,
     config::PreviewBackend,
     terminal::{
-        CaptureMode, KITTY_IMAGE_IDS, KITTY_PLACEMENT_ID, KITTY_THUMBNAIL_IMAGE_IDS,
-        KITTY_THUMBNAIL_PLACEMENT_ID, KITTY_TIMER_IMAGE_ID, KittyFramePlacement, TerminalGuard,
-        clear_screen_and_images, drain_input_events, draw_sidebar, enable_tmux_passthrough,
-        inside_tmux, looks_like_kitty, spawn_input_thread, ui_layout, write_kitty_delete_image,
-        write_kitty_mode_pill, write_kitty_recording_timer, write_kitty_rgb_frame,
-        write_kitty_shutter_button,
+        CaptureMode, KITTY_IMAGE_IDS, KITTY_NO_MIC_IMAGE_ID, KITTY_PLACEMENT_ID,
+        KITTY_THUMBNAIL_IMAGE_IDS, KITTY_THUMBNAIL_PLACEMENT_ID, KITTY_TIMER_IMAGE_ID,
+        KittyFramePlacement, TerminalGuard, clear_screen_and_images, drain_input_events,
+        draw_sidebar, enable_tmux_passthrough, inside_tmux, looks_like_kitty, spawn_input_thread,
+        ui_layout, write_kitty_delete_image, write_kitty_mode_pill, write_kitty_no_mic_pill,
+        write_kitty_recording_timer, write_kitty_rgb_frame, write_kitty_shutter_button,
     },
 };
 
@@ -78,6 +78,8 @@ pub(crate) fn run() -> Result<()> {
     let mut next_thumbnail_rescan = Instant::now() + Duration::from_millis(750);
     let mut capture_requested = false;
     let mut recording: Option<ActiveRecording> = None;
+    let mut no_mic_visible = false;
+    let audio_available = audio_input_available(&config);
 
     loop {
         if drain_input_events(
@@ -120,7 +122,12 @@ pub(crate) fn run() -> Result<()> {
         }
 
         if let Some(recording) = recording.as_mut() {
-            recording.encoder.write_frame(&frame)?;
+            match recording.encoder.write_frame(&config, &frame)? {
+                RecordingWriteStatus::Written => {}
+                RecordingWriteStatus::RestartedWithoutAudio => {
+                    recording.last_timer_second = None;
+                }
+            }
         }
 
         let layout = ui_layout(config.width, config.height);
@@ -133,6 +140,7 @@ pub(crate) fn run() -> Result<()> {
             frame_serial = 0;
             thumbnail_dirty = true;
             chrome_dirty = true;
+            no_mic_visible = false;
         }
 
         if chrome_dirty {
@@ -171,9 +179,18 @@ pub(crate) fn run() -> Result<()> {
                     if let Some(recording) = recording.take() {
                         recording.encoder.stop()?;
                         write_kitty_delete_image(&mut out, KITTY_TIMER_IMAGE_ID)?;
+                        if no_mic_visible {
+                            write_kitty_delete_image(&mut out, KITTY_NO_MIC_IMAGE_ID)?;
+                            no_mic_visible = false;
+                        }
                     } else {
+                        let encoder = if audio_available {
+                            VideoRecording::start(&config)?
+                        } else {
+                            VideoRecording::start_without_audio(&config)?
+                        };
                         recording = Some(ActiveRecording {
-                            encoder: VideoRecording::start(&config)?,
+                            encoder,
                             started_at: Instant::now(),
                             last_timer_second: None,
                         });
@@ -221,6 +238,23 @@ pub(crate) fn run() -> Result<()> {
         )?;
         previous_image_id = Some(image_id);
         frame_serial = frame_serial.wrapping_add(1);
+
+        if let Some(area) = layout.no_mic_area {
+            let no_audio = match &recording {
+                Some(recording) => !recording.encoder.audio(),
+                None => capture_mode == CaptureMode::Video && !audio_available,
+            };
+            if no_audio {
+                write_kitty_no_mic_pill(&mut out, area, &mut kitty_sequence)?;
+                no_mic_visible = true;
+            } else if no_mic_visible {
+                write_kitty_delete_image(&mut out, KITTY_NO_MIC_IMAGE_ID)?;
+                no_mic_visible = false;
+            }
+        } else if no_mic_visible {
+            write_kitty_delete_image(&mut out, KITTY_NO_MIC_IMAGE_ID)?;
+            no_mic_visible = false;
+        }
 
         if thumbnail_dirty {
             if let (Some(thumbnail), Some(area)) = (&last_thumbnail, layout.thumbnail_area) {

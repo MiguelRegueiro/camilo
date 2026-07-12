@@ -29,7 +29,6 @@ pub(crate) fn apply_best_camera_mode(config: &mut Config) {
         config.input_format = Some(ffmpeg_input_format(&mode.format).to_string());
         config.width = mode.width;
         config.height = mode.height;
-        config.fps = mode.fps;
     }
 }
 

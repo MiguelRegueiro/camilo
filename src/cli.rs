@@ -56,8 +56,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Config> {
     if config.width == 0 || config.height == 0 {
         bail!("width and height must be greater than zero");
     }
-    if config.fps == 0 || config.fps > 120 {
-        bail!("fps must be in the range 1..=120");
+    if config.fps == 0 {
+        bail!("fps must be greater than zero");
     }
 
     Ok(config)
@@ -83,4 +83,25 @@ Controls:
   q                          exit
 "
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fps_accepts_values_above_camera_probe_cap() {
+        let config = parse_args(["--fps".to_string(), "240".to_string()].into_iter())
+            .expect("high preview fps should be accepted");
+
+        assert_eq!(config.fps, 240);
+    }
+
+    #[test]
+    fn fps_rejects_zero() {
+        let error = parse_args(["--fps".to_string(), "0".to_string()].into_iter())
+            .expect_err("zero fps should fail");
+
+        assert!(error.to_string().contains("fps must be greater than zero"));
+    }
 }

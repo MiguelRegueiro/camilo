@@ -27,6 +27,8 @@ use crate::{
 struct ActiveRecording {
     encoder: VideoRecording,
     started_at: Instant,
+    next_frame_at: Instant,
+    frame_interval: Duration,
     last_timer_second: Option<u64>,
 }
 
@@ -80,6 +82,7 @@ pub(crate) fn run() -> Result<()> {
     let mut recording: Option<ActiveRecording> = None;
     let mut no_mic_visible = false;
     let audio_available = audio_input_available(&config);
+    let mut have_frame = false;
 
     loop {
         if drain_input_events(
@@ -93,11 +96,17 @@ pub(crate) fn run() -> Result<()> {
             break;
         }
 
-        match camera.read_latest_frame(&mut frame) {
-            Ok(CameraFrameStatus::NewFrame) => {}
+        let new_frame = match camera.read_latest_frame(&mut frame) {
+            Ok(CameraFrameStatus::NewFrame) => {
+                have_frame = true;
+                true
+            }
             Ok(CameraFrameStatus::NoFrame) => {
                 thread::sleep(Duration::from_millis(1));
-                continue;
+                if !have_frame {
+                    continue;
+                }
+                false
             }
             Ok(CameraFrameStatus::Ended) => {
                 camera.stop();
@@ -108,7 +117,7 @@ pub(crate) fn run() -> Result<()> {
                 bail!("camera stream ended: {}", stderr.trim());
             }
             Err(error) => bail!("failed to read camera frame: {error}"),
-        }
+        };
 
         if drain_input_events(
             &stop_rx,
@@ -122,12 +131,7 @@ pub(crate) fn run() -> Result<()> {
         }
 
         if let Some(recording) = recording.as_mut() {
-            match recording.encoder.write_frame(&config, &frame)? {
-                RecordingWriteStatus::Written => {}
-                RecordingWriteStatus::RestartedWithoutAudio => {
-                    recording.last_timer_second = None;
-                }
-            }
+            write_due_recording_frames(recording, &config, &frame, Instant::now())?;
         }
 
         let layout = ui_layout(config.width, config.height);
@@ -189,9 +193,12 @@ pub(crate) fn run() -> Result<()> {
                         } else {
                             VideoRecording::start_without_audio(&config)?
                         };
+                        let now = Instant::now();
                         recording = Some(ActiveRecording {
                             encoder,
-                            started_at: Instant::now(),
+                            started_at: now,
+                            next_frame_at: now,
+                            frame_interval: recording_frame_interval(config.fps),
                             last_timer_second: None,
                         });
                     }
@@ -208,6 +215,11 @@ pub(crate) fn run() -> Result<()> {
                 write_kitty_recording_timer(&mut out, area, elapsed, &mut kitty_sequence)?;
                 recording.last_timer_second = Some(elapsed_second);
             }
+        }
+
+        if !new_frame {
+            out.flush()?;
+            continue;
         }
 
         if Instant::now() >= next_thumbnail_rescan {
@@ -291,4 +303,26 @@ pub(crate) fn run() -> Result<()> {
     camera.stop();
 
     Ok(())
+}
+
+fn write_due_recording_frames(
+    recording: &mut ActiveRecording,
+    config: &crate::config::Config,
+    frame: &[u8],
+    now: Instant,
+) -> Result<()> {
+    while recording.next_frame_at <= now {
+        match recording.encoder.write_frame(config, frame)? {
+            RecordingWriteStatus::Written => {}
+            RecordingWriteStatus::RestartedWithoutAudio => {
+                recording.last_timer_second = None;
+            }
+        }
+        recording.next_frame_at += recording.frame_interval;
+    }
+    Ok(())
+}
+
+fn recording_frame_interval(fps: u32) -> Duration {
+    Duration::from_nanos(1_000_000_000 / u64::from(fps.max(1)))
 }

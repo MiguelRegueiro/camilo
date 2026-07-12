@@ -48,6 +48,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Config> {
                     .ok_or_else(|| anyhow!("{arg} expects auto, v4l2, or ffmpeg"))?;
             }
             "--force" => config.force = true,
+            "--camera-info" => config.camera_info = true,
             "--mirror-horizontal" => config.mirror_horizontal = true,
             "--no-audio" => config.audio = false,
             "--audio-input" => {
@@ -82,7 +83,7 @@ fn print_help() {
 camilo - camera app for the terminal
 
 Usage:
-  camilo [--device /dev/video0] [--width 1920] [--height 1080] [--fps 30] [--preview-backend auto|v4l2|ffmpeg] [--camera-dir ~/Pictures/Camera] [--mirror-horizontal] [--audio-input default] [--no-audio] [--force]
+  camilo [--device /dev/video0] [--width 1920] [--height 1080] [--fps 30] [--preview-backend auto|v4l2|ffmpeg] [--camera-dir ~/Pictures/Camera] [--mirror-horizontal] [--audio-input default] [--no-audio] [--force] [--camera-info]
 
 Controls:
   Right-side shutter button  take pictures or start/stop video recording
@@ -111,6 +112,14 @@ mod tests {
                 .expect("preview backend should parse");
 
         assert_eq!(config.preview_backend, PreviewBackend::Ffmpeg);
+    }
+
+    #[test]
+    fn camera_info_flag_enables_diagnostic_output() {
+        let config = parse_args(["--camera-info".to_string()].into_iter())
+            .expect("camera info flag should parse");
+
+        assert!(config.camera_info);
     }
 
     #[test]

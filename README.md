@@ -1,15 +1,16 @@
 # camilo
 
-Live camera preview for Kitty-compatible terminals.
+Camera app for the terminal.
 
-This first build is intentionally small:
+Camilo uses `ffmpeg` for camera input and the Kitty graphics protocol for the live preview, shutter controls, photo capture, and video recording.
 
-- Rust app
-- `ffmpeg` camera backend
-- Kitty graphics protocol
-- right-side capture controls
+## Terminal Compatibility
 
-Run:
+| Terminal | Status | Notes |
+| --- | --- | --- |
+| Kitty | Supported | Recommended and tested target. |
+
+## Run
 
 ```sh
 cargo run --release
@@ -21,7 +22,7 @@ Useful options:
 cargo run --release -- --device /dev/video0 --width 1920 --height 1080 --fps 30
 ```
 
-Optional config:
+## Config
 
 ```toml
 # ~/.config/camilo/config.toml
@@ -39,11 +40,10 @@ To mirror only for one run:
 cargo run --release -- --mirror-horizontal
 ```
 
-Controls:
+## Controls
 
 - Use the right-side shutter button to take pictures or start/stop video recording.
 - Use the right-side mode switch to toggle photo/video mode.
-- `q`, `Esc`, or `Ctrl-C` exits.
+- Press `q` to quit.
 
-Linux and FreeBSD both use the `v4l2` ffmpeg input in this prototype. On
-FreeBSD, that expects a webcam exposed by `webcamd`, usually as `/dev/video0`.
+Linux and FreeBSD both use the `v4l2` ffmpeg input. On FreeBSD, that expects a webcam exposed by `webcamd`, usually as `/dev/video0`.

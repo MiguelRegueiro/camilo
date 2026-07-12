@@ -10,8 +10,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use zune_jpeg::{JpegDecoder, zune_core::bytestream::ZCursor};
 
-use crate::config::Config;
+use crate::config::{Config, PreviewBackend};
 
 pub(crate) const RAW_RGB_BYTES_PER_PIXEL: usize = 3;
 pub(crate) const THUMBNAIL_SIZE: u32 = 160;
@@ -576,7 +577,45 @@ fn camera_stream_ffmpeg_args(config: &Config) -> Vec<String> {
     args
 }
 
-pub(crate) struct CameraStream {
+pub(crate) enum CameraStream {
+    Ffmpeg(FfmpegCameraStream),
+    V4l2(V4l2CameraStream),
+}
+
+impl CameraStream {
+    pub(crate) fn spawn(config: &Config) -> Result<Self> {
+        match config.preview_backend {
+            PreviewBackend::Ffmpeg => FfmpegCameraStream::spawn(config).map(Self::Ffmpeg),
+            PreviewBackend::V4l2 => V4l2CameraStream::spawn(config).map(Self::V4l2),
+            PreviewBackend::Auto => V4l2CameraStream::spawn(config)
+                .map(Self::V4l2)
+                .or_else(|_| FfmpegCameraStream::spawn(config).map(Self::Ffmpeg)),
+        }
+    }
+
+    pub(crate) fn read_latest_frame(&mut self, frame: &mut [u8]) -> io::Result<CameraFrameStatus> {
+        match self {
+            Self::Ffmpeg(stream) => stream.read_latest_frame(frame),
+            Self::V4l2(stream) => stream.read_latest_frame(frame),
+        }
+    }
+
+    pub(crate) fn stderr_text(&self) -> String {
+        match self {
+            Self::Ffmpeg(stream) => stream.stderr_text(),
+            Self::V4l2(stream) => stream.stderr_text(),
+        }
+    }
+
+    pub(crate) fn stop(&mut self) {
+        match self {
+            Self::Ffmpeg(stream) => stream.stop(),
+            Self::V4l2(stream) => stream.stop(),
+        }
+    }
+}
+
+pub(crate) struct FfmpegCameraStream {
     child: Child,
     latest_frame: Arc<Mutex<LatestCameraFrame>>,
     delivered_serial: u64,
@@ -585,8 +624,8 @@ pub(crate) struct CameraStream {
     stderr_thread: Option<thread::JoinHandle<()>>,
 }
 
-impl CameraStream {
-    pub(crate) fn spawn(config: &Config) -> Result<Self> {
+impl FfmpegCameraStream {
+    fn spawn(config: &Config) -> Result<Self> {
         let args = camera_stream_ffmpeg_args(config);
 
         let mut child = Command::new("ffmpeg")
@@ -638,45 +677,18 @@ impl CameraStream {
         })
     }
 
-    pub(crate) fn read_latest_frame(&mut self, frame: &mut [u8]) -> io::Result<CameraFrameStatus> {
-        let mut state = self
-            .latest_frame
-            .lock()
-            .map_err(|_| io::Error::other("camera frame state is poisoned"))?;
-        if state.serial != self.delivered_serial {
-            let Some(latest_frame) = state.frame.as_ref() else {
-                return Ok(CameraFrameStatus::NoFrame);
-            };
-            if latest_frame.len() != frame.len() {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!(
-                        "camera frame has {} bytes, expected {}",
-                        latest_frame.len(),
-                        frame.len()
-                    ),
-                ));
-            }
-            frame.copy_from_slice(latest_frame);
-            self.delivered_serial = state.serial;
-            Ok(CameraFrameStatus::NewFrame)
-        } else if let Some(error) = state.error.take() {
-            Err(io::Error::other(error))
-        } else if state.ended {
-            Ok(CameraFrameStatus::Ended)
-        } else {
-            Ok(CameraFrameStatus::NoFrame)
-        }
+    fn read_latest_frame(&mut self, frame: &mut [u8]) -> io::Result<CameraFrameStatus> {
+        read_latest_stored_frame(&self.latest_frame, &mut self.delivered_serial, frame)
     }
 
-    pub(crate) fn stderr_text(&self) -> String {
+    fn stderr_text(&self) -> String {
         self.stderr
             .lock()
             .map(|text| text.clone())
             .unwrap_or_default()
     }
 
-    pub(crate) fn stop(&mut self) {
+    fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(handle) = self.frame_thread.take() {
@@ -688,9 +700,423 @@ impl CameraStream {
     }
 }
 
-impl Drop for CameraStream {
+impl Drop for FfmpegCameraStream {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+pub(crate) struct V4l2CameraStream {
+    latest_frame: Arc<Mutex<LatestCameraFrame>>,
+    delivered_serial: u64,
+    frame_thread: Option<thread::JoinHandle<()>>,
+    stderr: Arc<Mutex<String>>,
+}
+
+impl V4l2CameraStream {
+    fn spawn(config: &Config) -> Result<Self> {
+        let frame_len = frame_len(config.width, config.height)?;
+        let latest_frame = Arc::new(Mutex::new(LatestCameraFrame::default()));
+        let stderr = Arc::new(Mutex::new(String::new()));
+        let frame_target = Arc::clone(&latest_frame);
+        let stderr_target = Arc::clone(&stderr);
+        let config = config.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let frame_thread = thread::spawn(move || {
+            run_v4l2_capture(&config, frame_len, &frame_target, &stderr_target, ready_tx);
+        });
+
+        match ready_rx
+            .recv()
+            .unwrap_or_else(|_| Err("v4l2 capture thread stopped during setup".to_string()))
+        {
+            Ok(()) => Ok(Self {
+                latest_frame,
+                delivered_serial: 0,
+                frame_thread: Some(frame_thread),
+                stderr,
+            }),
+            Err(error) => {
+                let _ = frame_thread.join();
+                Err(anyhow!(error))
+            }
+        }
+    }
+
+    fn read_latest_frame(&mut self, frame: &mut [u8]) -> io::Result<CameraFrameStatus> {
+        read_latest_stored_frame(&self.latest_frame, &mut self.delivered_serial, frame)
+    }
+
+    fn stderr_text(&self) -> String {
+        self.stderr
+            .lock()
+            .map(|text| text.clone())
+            .unwrap_or_default()
+    }
+
+    fn stop(&mut self) {
+        mark_camera_stream_ended(&self.latest_frame);
+        if let Some(handle) = self.frame_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for V4l2CameraStream {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn read_latest_stored_frame(
+    latest_frame: &Arc<Mutex<LatestCameraFrame>>,
+    delivered_serial: &mut u64,
+    frame: &mut [u8],
+) -> io::Result<CameraFrameStatus> {
+    let mut state = latest_frame
+        .lock()
+        .map_err(|_| io::Error::other("camera frame state is poisoned"))?;
+    if state.serial != *delivered_serial {
+        let Some(latest_frame) = state.frame.as_ref() else {
+            return Ok(CameraFrameStatus::NoFrame);
+        };
+        if latest_frame.len() != frame.len() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "camera frame has {} bytes, expected {}",
+                    latest_frame.len(),
+                    frame.len()
+                ),
+            ));
+        }
+        frame.copy_from_slice(latest_frame);
+        *delivered_serial = state.serial;
+        Ok(CameraFrameStatus::NewFrame)
+    } else if let Some(error) = state.error.take() {
+        Err(io::Error::other(error))
+    } else if state.ended {
+        Ok(CameraFrameStatus::Ended)
+    } else {
+        Ok(CameraFrameStatus::NoFrame)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V4l2PixelFormat {
+    Rgb24,
+    Yuyv,
+    Mjpeg,
+}
+
+impl V4l2PixelFormat {
+    fn fourcc(self) -> v4l::FourCC {
+        match self {
+            Self::Rgb24 => v4l::FourCC::new(b"RGB3"),
+            Self::Yuyv => v4l::FourCC::new(b"YUYV"),
+            Self::Mjpeg => v4l::FourCC::new(b"MJPG"),
+        }
+    }
+
+    fn from_fourcc(fourcc: v4l::FourCC) -> Option<Self> {
+        if fourcc == Self::Rgb24.fourcc() {
+            Some(Self::Rgb24)
+        } else if fourcc == Self::Yuyv.fourcc() {
+            Some(Self::Yuyv)
+        } else if fourcc == Self::Mjpeg.fourcc() {
+            Some(Self::Mjpeg)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct V4l2FrameConfig {
+    pixel_format: V4l2PixelFormat,
+    width: u32,
+    height: u32,
+    mirror_horizontal: bool,
+    frame_len: usize,
+}
+
+fn preferred_v4l2_formats(config: &Config) -> Vec<V4l2PixelFormat> {
+    let mut formats = Vec::new();
+    if let Some(input_format) = &config.input_format {
+        let preferred = match input_format.as_str() {
+            "mjpeg" | "MJPG" => Some(V4l2PixelFormat::Mjpeg),
+            "yuyv422" | "YUYV" => Some(V4l2PixelFormat::Yuyv),
+            "rgb24" | "RGB3" => Some(V4l2PixelFormat::Rgb24),
+            _ => None,
+        };
+        if let Some(preferred) = preferred {
+            formats.push(preferred);
+        }
+    }
+    for format in [
+        V4l2PixelFormat::Yuyv,
+        V4l2PixelFormat::Mjpeg,
+        V4l2PixelFormat::Rgb24,
+    ] {
+        if !formats.contains(&format) {
+            formats.push(format);
+        }
+    }
+    formats
+}
+
+fn run_v4l2_capture(
+    config: &Config,
+    frame_len: usize,
+    latest_frame: &Arc<Mutex<LatestCameraFrame>>,
+    stderr: &Arc<Mutex<String>>,
+    ready: std::sync::mpsc::Sender<std::result::Result<(), String>>,
+) {
+    if let Err(error) = run_v4l2_capture_inner(config, frame_len, latest_frame, &ready) {
+        let _ = ready.send(Err(error.clone()));
+        set_camera_stream_text(stderr, &error);
+        mark_camera_stream_error(latest_frame, io::Error::other(error));
+    }
+}
+
+fn run_v4l2_capture_inner(
+    config: &Config,
+    frame_len: usize,
+    latest_frame: &Arc<Mutex<LatestCameraFrame>>,
+    ready: &std::sync::mpsc::Sender<std::result::Result<(), String>>,
+) -> std::result::Result<(), String> {
+    use v4l::buffer::Type;
+    use v4l::io::mmap::Stream as MmapStream;
+    use v4l::prelude::*;
+    use v4l::video::Capture;
+    use v4l::video::capture::Parameters;
+
+    let device = Device::with_path(&config.device)
+        .map_err(|error| format!("failed to open v4l2 device {}: {error}", config.device))?;
+
+    let mut selected = None;
+    let mut setup_errors = Vec::new();
+    for pixel_format in preferred_v4l2_formats(config) {
+        let requested = v4l::Format::new(config.width, config.height, pixel_format.fourcc());
+        let actual = match device.set_format(&requested) {
+            Ok(actual) => actual,
+            Err(error) => {
+                setup_errors.push(format!("{pixel_format:?}: {error}"));
+                continue;
+            }
+        };
+        if actual.width != config.width || actual.height != config.height {
+            setup_errors.push(format!(
+                "{pixel_format:?}: device selected {}x{}",
+                actual.width, actual.height
+            ));
+            continue;
+        }
+        if let Some(actual_format) = V4l2PixelFormat::from_fourcc(actual.fourcc) {
+            selected = Some(actual_format);
+            break;
+        }
+    }
+    let frame_config = V4l2FrameConfig {
+        pixel_format: selected.ok_or_else(|| {
+            format!(
+                "v4l2 device did not accept a supported {}x{} RGB/YUYV/MJPG preview mode{}",
+                config.width,
+                config.height,
+                if setup_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", setup_errors.join("; "))
+                }
+            )
+        })?,
+        width: config.width,
+        height: config.height,
+        mirror_horizontal: config.mirror_horizontal,
+        frame_len,
+    };
+
+    device
+        .set_params(&Parameters::with_fps(config.fps))
+        .map_err(|error| format!("failed to set v4l2 fps {}: {error}", config.fps))?;
+
+    let mut stream = MmapStream::with_buffers(&device, Type::VideoCapture, 2)
+        .map_err(|error| format!("failed to create v4l2 mmap stream: {error}"))?;
+    stream.set_timeout(std::time::Duration::from_millis(100));
+
+    let mut buffer = vec![0_u8; frame_len];
+    buffer = match store_v4l2_next_frame(&mut stream, frame_config, latest_frame, &mut buffer) {
+        Ok(reused) => {
+            let _ = ready.send(Ok(()));
+            reused
+        }
+        Err(error) => return Err(format!("failed to read first v4l2 frame: {error}")),
+    };
+
+    loop {
+        match store_v4l2_next_frame(&mut stream, frame_config, latest_frame, &mut buffer) {
+            Ok(reused) => buffer = reused,
+            Err(error) if error.kind() == ErrorKind::TimedOut => {
+                if latest_frame.lock().map(|state| state.ended).unwrap_or(true) {
+                    break;
+                }
+            }
+            Err(error) => return Err(format!("failed to read v4l2 frame: {error}")),
+        }
+    }
+    Ok(())
+}
+
+fn store_v4l2_next_frame(
+    stream: &mut v4l::io::mmap::Stream<'_>,
+    config: V4l2FrameConfig,
+    latest_frame: &Arc<Mutex<LatestCameraFrame>>,
+    buffer: &mut [u8],
+) -> io::Result<Vec<u8>> {
+    use v4l::io::traits::CaptureStream;
+
+    let (frame, metadata) = stream.next()?;
+    let used = (metadata.bytesused as usize).min(frame.len());
+    decode_v4l2_frame(
+        config.pixel_format,
+        &frame[..used],
+        config.width,
+        config.height,
+        buffer,
+    )
+    .map_err(io::Error::other)?;
+    if config.mirror_horizontal {
+        mirror_rgb24_in_place(buffer, config.width, config.height);
+    }
+    Ok(store_latest_frame(
+        latest_frame,
+        buffer.to_vec(),
+        config.frame_len,
+    ))
+}
+
+fn decode_v4l2_frame(
+    pixel_format: V4l2PixelFormat,
+    frame: &[u8],
+    width: u32,
+    height: u32,
+    out: &mut [u8],
+) -> std::result::Result<(), String> {
+    match pixel_format {
+        V4l2PixelFormat::Rgb24 => copy_rgb24_frame(frame, out),
+        V4l2PixelFormat::Yuyv => convert_yuyv_to_rgb24(frame, width, height, out),
+        V4l2PixelFormat::Mjpeg => decode_mjpeg_to_rgb24(frame, width, height, out),
+    }
+}
+
+fn copy_rgb24_frame(frame: &[u8], out: &mut [u8]) -> std::result::Result<(), String> {
+    if frame.len() < out.len() {
+        return Err(format!(
+            "rgb24 frame has {} bytes, expected at least {}",
+            frame.len(),
+            out.len()
+        ));
+    }
+    out.copy_from_slice(&frame[..out.len()]);
+    Ok(())
+}
+
+fn convert_yuyv_to_rgb24(
+    frame: &[u8],
+    width: u32,
+    height: u32,
+    out: &mut [u8],
+) -> std::result::Result<(), String> {
+    let expected_in = width as usize * height as usize * 2;
+    let expected_out = width as usize * height as usize * RAW_RGB_BYTES_PER_PIXEL;
+    if frame.len() < expected_in || out.len() < expected_out {
+        return Err(format!(
+            "yuyv frame has {} bytes and output has {}, expected {expected_in}/{expected_out}",
+            frame.len(),
+            out.len()
+        ));
+    }
+
+    let mut dst = 0;
+    for chunk in frame[..expected_in].chunks_exact(4) {
+        let y0 = chunk[0];
+        let u = chunk[1];
+        let y1 = chunk[2];
+        let v = chunk[3];
+        let [r, g, b] = yuv_to_rgb(y0, u, v);
+        out[dst..dst + 3].copy_from_slice(&[r, g, b]);
+        let [r, g, b] = yuv_to_rgb(y1, u, v);
+        out[dst + 3..dst + 6].copy_from_slice(&[r, g, b]);
+        dst += 6;
+    }
+    Ok(())
+}
+
+fn yuv_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
+    let c = i32::from(y).saturating_sub(16).max(0);
+    let d = i32::from(u) - 128;
+    let e = i32::from(v) - 128;
+    [
+        clamp_rgb((298 * c + 409 * e + 128) >> 8),
+        clamp_rgb((298 * c - 100 * d - 208 * e + 128) >> 8),
+        clamp_rgb((298 * c + 516 * d + 128) >> 8),
+    ]
+}
+
+fn clamp_rgb(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
+}
+
+fn decode_mjpeg_to_rgb24(
+    frame: &[u8],
+    width: u32,
+    height: u32,
+    out: &mut [u8],
+) -> std::result::Result<(), String> {
+    let mut decoder = JpegDecoder::new(ZCursor::new(frame));
+    let decoded = decoder
+        .decode()
+        .map_err(|error| format!("failed to decode mjpeg frame: {error}"))?;
+    let info = decoder
+        .info()
+        .ok_or_else(|| "mjpeg frame did not report dimensions".to_string())?;
+    if usize::from(info.width) != width as usize || usize::from(info.height) != height as usize {
+        return Err(format!(
+            "mjpeg frame is {}x{}, expected {}x{}",
+            info.width, info.height, width, height
+        ));
+    }
+    if decoded.len() != out.len() {
+        return Err(format!(
+            "mjpeg decoded to {} bytes, expected {} rgb bytes",
+            decoded.len(),
+            out.len()
+        ));
+    }
+    out.copy_from_slice(&decoded);
+    Ok(())
+}
+
+fn mirror_rgb24_in_place(frame: &mut [u8], width: u32, height: u32) {
+    let width = width as usize;
+    let height = height as usize;
+    let stride = width * RAW_RGB_BYTES_PER_PIXEL;
+    for y in 0..height {
+        let row = y * stride;
+        for x in 0..width / 2 {
+            let left = row + x * RAW_RGB_BYTES_PER_PIXEL;
+            let right = row + (width - 1 - x) * RAW_RGB_BYTES_PER_PIXEL;
+            for channel in 0..RAW_RGB_BYTES_PER_PIXEL {
+                frame.swap(left + channel, right + channel);
+            }
+        }
+    }
+}
+
+fn set_camera_stream_text(state: &Arc<Mutex<String>>, text: &str) {
+    if let Ok(mut state) = state.lock() {
+        *state = text.to_string();
     }
 }
 
@@ -724,6 +1150,42 @@ mod tests {
         let state = state.lock().expect("state should lock");
         assert_eq!(state.frame, Some(vec![2, 2, 2]));
         assert_eq!(state.serial, 2);
+    }
+
+    #[test]
+    fn v4l2_format_preference_honors_probed_mjpeg_mode_first() {
+        let config = Config {
+            input_format: Some("mjpeg".to_string()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            preferred_v4l2_formats(&config),
+            vec![
+                V4l2PixelFormat::Mjpeg,
+                V4l2PixelFormat::Yuyv,
+                V4l2PixelFormat::Rgb24,
+            ]
+        );
+    }
+
+    #[test]
+    fn yuyv_conversion_outputs_rgb_pairs() {
+        let frame = [16, 128, 235, 128];
+        let mut out = [0_u8; 6];
+
+        convert_yuyv_to_rgb24(&frame, 2, 1, &mut out).expect("yuyv should convert");
+
+        assert_eq!(out, [0, 0, 0, 255, 255, 255]);
+    }
+
+    #[test]
+    fn rgb_mirror_flips_rows_in_place() {
+        let mut frame = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+        mirror_rgb24_in_place(&mut frame, 2, 2);
+
+        assert_eq!(frame, vec![4, 5, 6, 1, 2, 3, 10, 11, 12, 7, 8, 9]);
     }
 
     #[test]

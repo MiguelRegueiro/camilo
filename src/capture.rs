@@ -583,7 +583,7 @@ pub(crate) enum CameraStream {
 }
 
 impl CameraStream {
-    pub(crate) fn spawn(config: &Config) -> Result<Self> {
+    pub(crate) fn spawn(config: &mut Config) -> Result<Self> {
         match config.preview_backend {
             PreviewBackend::Ffmpeg => FfmpegCameraStream::spawn(config).map(Self::Ffmpeg),
             PreviewBackend::V4l2 => V4l2CameraStream::spawn(config).map(Self::V4l2),
@@ -714,29 +714,33 @@ pub(crate) struct V4l2CameraStream {
 }
 
 impl V4l2CameraStream {
-    fn spawn(config: &Config) -> Result<Self> {
-        let frame_len = frame_len(config.width, config.height)?;
+    fn spawn(config: &mut Config) -> Result<Self> {
         let latest_frame = Arc::new(Mutex::new(LatestCameraFrame::default()));
         let stderr = Arc::new(Mutex::new(String::new()));
         let frame_target = Arc::clone(&latest_frame);
         let stderr_target = Arc::clone(&stderr);
-        let config = config.clone();
+        let requested_config = config.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
         let frame_thread = thread::spawn(move || {
-            run_v4l2_capture(&config, frame_len, &frame_target, &stderr_target, ready_tx);
+            run_v4l2_capture(&requested_config, &frame_target, &stderr_target, ready_tx);
         });
 
         match ready_rx
             .recv()
             .unwrap_or_else(|_| Err("v4l2 capture thread stopped during setup".to_string()))
         {
-            Ok(()) => Ok(Self {
-                latest_frame,
-                delivered_serial: 0,
-                frame_thread: Some(frame_thread),
-                stderr,
-            }),
+            Ok(info) => {
+                config.width = info.width;
+                config.height = info.height;
+                config.input_format = Some(info.input_format.to_string());
+                Ok(Self {
+                    latest_frame,
+                    delivered_serial: 0,
+                    frame_thread: Some(frame_thread),
+                    stderr,
+                })
+            }
             Err(error) => {
                 let _ = frame_thread.join();
                 Err(anyhow!(error))
@@ -830,6 +834,21 @@ impl V4l2PixelFormat {
             None
         }
     }
+
+    fn input_format(self) -> &'static str {
+        match self {
+            Self::Rgb24 => "rgb24",
+            Self::Yuyv => "yuyv422",
+            Self::Mjpeg => "mjpeg",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct V4l2StreamInfo {
+    width: u32,
+    height: u32,
+    input_format: &'static str,
 }
 
 #[derive(Clone, Copy)]
@@ -868,12 +887,11 @@ fn preferred_v4l2_formats(config: &Config) -> Vec<V4l2PixelFormat> {
 
 fn run_v4l2_capture(
     config: &Config,
-    frame_len: usize,
     latest_frame: &Arc<Mutex<LatestCameraFrame>>,
     stderr: &Arc<Mutex<String>>,
-    ready: std::sync::mpsc::Sender<std::result::Result<(), String>>,
+    ready: std::sync::mpsc::Sender<std::result::Result<V4l2StreamInfo, String>>,
 ) {
-    if let Err(error) = run_v4l2_capture_inner(config, frame_len, latest_frame, &ready) {
+    if let Err(error) = run_v4l2_capture_inner(config, latest_frame, &ready) {
         let _ = ready.send(Err(error.clone()));
         set_camera_stream_text(stderr, &error);
         mark_camera_stream_error(latest_frame, io::Error::other(error));
@@ -882,9 +900,8 @@ fn run_v4l2_capture(
 
 fn run_v4l2_capture_inner(
     config: &Config,
-    frame_len: usize,
     latest_frame: &Arc<Mutex<LatestCameraFrame>>,
-    ready: &std::sync::mpsc::Sender<std::result::Result<(), String>>,
+    ready: &std::sync::mpsc::Sender<std::result::Result<V4l2StreamInfo, String>>,
 ) -> std::result::Result<(), String> {
     use v4l::buffer::Type;
     use v4l::io::mmap::Stream as MmapStream;
@@ -895,77 +912,106 @@ fn run_v4l2_capture_inner(
     let device = Device::with_path(&config.device)
         .map_err(|error| format!("failed to open v4l2 device {}: {error}", config.device))?;
 
-    let mut selected = None;
     let mut setup_errors = Vec::new();
-    for pixel_format in preferred_v4l2_formats(config) {
-        let requested = v4l::Format::new(config.width, config.height, pixel_format.fourcc());
-        let actual = match device.set_format(&requested) {
-            Ok(actual) => actual,
-            Err(error) => {
-                setup_errors.push(format!("{pixel_format:?}: {error}"));
-                continue;
-            }
-        };
-        if actual.width != config.width || actual.height != config.height {
-            setup_errors.push(format!(
-                "{pixel_format:?}: device selected {}x{}",
-                actual.width, actual.height
-            ));
-            continue;
-        }
-        if let Some(actual_format) = V4l2PixelFormat::from_fourcc(actual.fourcc) {
-            selected = Some(actual_format);
-            break;
-        }
-    }
-    let frame_config = V4l2FrameConfig {
-        pixel_format: selected.ok_or_else(|| {
-            format!(
-                "v4l2 device did not accept a supported {}x{} RGB/YUYV/MJPG preview mode{}",
-                config.width,
-                config.height,
-                if setup_errors.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {}", setup_errors.join("; "))
+    let Some((mut stream, frame_config, mut buffer)) = preferred_v4l2_formats(config)
+        .into_iter()
+        .find_map(|pixel_format| {
+            let requested = v4l::Format::new(config.width, config.height, pixel_format.fourcc());
+            let actual = match device.set_format(&requested) {
+                Ok(actual) => actual,
+                Err(error) => {
+                    setup_errors.push(format!("{pixel_format:?}: {error}"));
+                    return None;
                 }
-            )
-        })?,
-        width: config.width,
-        height: config.height,
-        mirror_horizontal: config.mirror_horizontal,
-        frame_len,
+            };
+            let Some(actual_format) = V4l2PixelFormat::from_fourcc(actual.fourcc) else {
+                setup_errors.push(format!(
+                    "{pixel_format:?}: device selected unsupported {}",
+                    actual.fourcc
+                ));
+                return None;
+            };
+            if let Err(error) = device.set_params(&Parameters::with_fps(config.fps)) {
+                setup_errors.push(format!(
+                    "{actual_format:?}: failed to set fps {}: {error}",
+                    config.fps
+                ));
+                return None;
+            }
+            let frame_len = match frame_len(actual.width, actual.height) {
+                Ok(frame_len) => frame_len,
+                Err(error) => {
+                    setup_errors.push(format!(
+                        "{actual_format:?}: invalid frame size {}x{}: {error}",
+                        actual.width, actual.height
+                    ));
+                    return None;
+                }
+            };
+            let frame_config = V4l2FrameConfig {
+                pixel_format: actual_format,
+                width: actual.width,
+                height: actual.height,
+                mirror_horizontal: config.mirror_horizontal,
+                frame_len,
+            };
+            let mut stream = match MmapStream::with_buffers(&device, Type::VideoCapture, 2) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    setup_errors.push(format!(
+                        "{actual_format:?}: failed to create mmap stream: {error}"
+                    ));
+                    return None;
+                }
+            };
+            stream.set_timeout(std::time::Duration::from_secs(3));
+            let mut buffer = vec![0_u8; frame_config.frame_len];
+            match store_v4l2_next_frame(&mut stream, frame_config, latest_frame, &mut buffer) {
+                Ok(reused) => {
+                    stream.set_timeout(std::time::Duration::from_millis(100));
+                    Some((stream, frame_config, reused))
+                }
+                Err(error) => {
+                    setup_errors.push(format!(
+                        "{actual_format:?}: failed to read first frame: {error}"
+                    ));
+                    None
+                }
+            }
+        })
+    else {
+        return Err(format!(
+            "v4l2 device did not produce a frame for a supported RGB/YUYV/MJPG preview mode near {}x{}{}",
+            config.width,
+            config.height,
+            if setup_errors.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", setup_errors.join("; "))
+            }
+        ));
     };
-
-    device
-        .set_params(&Parameters::with_fps(config.fps))
-        .map_err(|error| format!("failed to set v4l2 fps {}: {error}", config.fps))?;
-
-    let mut stream = MmapStream::with_buffers(&device, Type::VideoCapture, 2)
-        .map_err(|error| format!("failed to create v4l2 mmap stream: {error}"))?;
-    stream.set_timeout(std::time::Duration::from_millis(100));
-
-    let mut buffer = vec![0_u8; frame_len];
-    buffer = match store_v4l2_next_frame(&mut stream, frame_config, latest_frame, &mut buffer) {
-        Ok(reused) => {
-            let _ = ready.send(Ok(()));
-            reused
-        }
-        Err(error) => return Err(format!("failed to read first v4l2 frame: {error}")),
-    };
+    let _ = ready.send(Ok(V4l2StreamInfo {
+        width: frame_config.width,
+        height: frame_config.height,
+        input_format: frame_config.pixel_format.input_format(),
+    }));
 
     loop {
+        if camera_stream_should_stop(latest_frame) {
+            break;
+        }
         match store_v4l2_next_frame(&mut stream, frame_config, latest_frame, &mut buffer) {
             Ok(reused) => buffer = reused,
-            Err(error) if error.kind() == ErrorKind::TimedOut => {
-                if latest_frame.lock().map(|state| state.ended).unwrap_or(true) {
-                    break;
-                }
-            }
+            Err(error) if error.kind() == ErrorKind::TimedOut => {}
             Err(error) => return Err(format!("failed to read v4l2 frame: {error}")),
         }
     }
     Ok(())
+}
+
+fn camera_stream_should_stop(state: &Arc<Mutex<LatestCameraFrame>>) -> bool {
+    state.lock().map(|state| state.ended).unwrap_or(true)
 }
 
 fn store_v4l2_next_frame(

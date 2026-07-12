@@ -50,6 +50,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Config> {
             "--force" => config.force = true,
             "--camera-info" => config.camera_info = true,
             "--mirror-horizontal" => config.mirror_horizontal = true,
+            "--no-mirror-horizontal" => config.mirror_horizontal = false,
             "--no-audio" => config.audio = false,
             "--audio-input" => {
                 config.audio_input = args
@@ -83,7 +84,7 @@ fn print_help() {
 camilo - camera app for the terminal
 
 Usage:
-  camilo [--device /dev/video0] [--width 1920] [--height 1080] [--fps 30] [--preview-backend auto|v4l2|ffmpeg] [--camera-dir ~/Pictures/Camera] [--mirror-horizontal] [--audio-input default] [--no-audio] [--force] [--camera-info]
+  camilo [--device /dev/video0] [--width 1920] [--height 1080] [--fps 30] [--preview-backend auto|v4l2|ffmpeg] [--camera-dir ~/Pictures/Camera] [--mirror-horizontal] [--no-mirror-horizontal] [--audio-input default] [--no-audio] [--force] [--camera-info]
 
 Controls:
   Right-side shutter button  take pictures or start/stop video recording
@@ -120,6 +121,14 @@ mod tests {
             .expect("camera info flag should parse");
 
         assert!(config.camera_info);
+    }
+
+    #[test]
+    fn no_mirror_horizontal_flag_disables_default_mirror() {
+        let config = parse_args(["--no-mirror-horizontal".to_string()].into_iter())
+            .expect("no mirror flag should parse");
+
+        assert!(!config.mirror_horizontal);
     }
 
     #[test]

@@ -53,7 +53,7 @@ impl Default for Config {
             preview_backend: PreviewBackend::Auto,
             force: false,
             camera_info: false,
-            mirror_horizontal: false,
+            mirror_horizontal: true,
             camera_dir: default_camera_dir(),
             audio: true,
             audio_input: DEFAULT_AUDIO_INPUT.to_string(),
@@ -207,10 +207,10 @@ mod tests {
     fn config_file_applies_horizontal_mirror() {
         let mut config = Config::default();
 
-        apply_config_text(&mut config, "mirror_horizontal = true\n")
+        apply_config_text(&mut config, "mirror_horizontal = false\n")
             .expect("config file should parse");
 
-        assert!(config.mirror_horizontal);
+        assert!(!config.mirror_horizontal);
         assert_eq!(config.device, DEFAULT_DEVICE);
     }
 

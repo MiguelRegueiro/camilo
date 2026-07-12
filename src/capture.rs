@@ -2234,11 +2234,11 @@ mod tests {
     fn ffmpeg_filter_adds_hflip_when_horizontal_mirror_is_enabled() {
         let mut config = Config::default();
 
-        assert!(!ffmpeg_video_filter(&config).starts_with("hflip,"));
+        assert!(ffmpeg_video_filter(&config).starts_with("hflip,"));
 
-        config.mirror_horizontal = true;
+        config.mirror_horizontal = false;
         let filter = ffmpeg_video_filter(&config);
-        assert!(filter.starts_with("hflip,scale="));
+        assert!(filter.starts_with("scale="));
         assert!(filter.contains("force_original_aspect_ratio=increase,crop="));
         assert!(!filter.contains("fps="));
     }

@@ -35,21 +35,21 @@ Preview backends:
 
 ```toml
 # ~/.config/camilo/config.toml
-mirror_horizontal = true
 camera_dir = "~/Pictures/Camera"
 # device = "/dev/video0"
 # width = 1920
 # height = 1080
 # fps = 30
 # preview_backend = "auto" # auto | v4l2 | ffmpeg
+# mirror_horizontal = true
 # audio = true
 # audio_input = "default"
 ```
 
-To mirror only for one run:
+Preview is mirrored horizontally by default. To disable mirroring only for one run:
 
 ```sh
-cargo run --release -- --mirror-horizontal
+cargo run --release -- --no-mirror-horizontal
 ```
 
 Audio is recorded from the system default microphone. Set `audio_input` to override it, or disable audio for one run:

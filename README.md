@@ -1,10 +1,8 @@
-<p align="center">
-  <img src="assets/logo.png" width="160" alt="camilo logo">
+<h1 align="left"><img src="assets/logo.png" width="64" alt="camilo logo" align="absmiddle" />&nbsp;camilo</h1>
+
+<p>
+  A camera app for the terminal.
 </p>
-
-# camilo
-
-Camera app for the terminal.
 
 Camilo uses direct V4L2 preview on Linux and FreeBSD, `ffmpeg` as fallback/encoder, and the Kitty graphics protocol for the live preview, shutter controls, photo capture, and video recording.
 

@@ -1,6 +1,6 @@
 use std::{sync::mpsc, thread};
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, MouseButton, MouseEventKind};
 
 use super::layout::UiLayout;
 
@@ -30,12 +30,7 @@ pub(crate) fn spawn_input_thread() -> mpsc::Receiver<InputEvent> {
     thread::spawn(move || {
         loop {
             match event::read() {
-                Ok(Event::Key(key))
-                    if key.code == KeyCode::Esc
-                        || key.code == KeyCode::Char('q')
-                        || (key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)) =>
-                {
+                Ok(Event::Key(key)) if key.code == KeyCode::Char('q') => {
                     let _ = tx.send(InputEvent::Quit);
                     break;
                 }

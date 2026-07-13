@@ -19,9 +19,20 @@ pub(crate) struct CameraMode {
 
 pub(crate) fn apply_best_camera_mode(config: &mut Config) {
     if let Ok(mode) = best_camera_mode(&config.device) {
-        config.input_format = Some(ffmpeg_input_format(&mode.format).to_string());
+        apply_camera_mode(config, &mode);
+    }
+}
+
+fn apply_camera_mode(config: &mut Config, mode: &CameraMode) {
+    config.input_format = Some(ffmpeg_input_format(&mode.format).to_string());
+    if !config.width_set {
         config.width = mode.width;
+    }
+    if !config.height_set {
         config.height = mode.height;
+    }
+    if !config.fps_set && mode.fps > 0 {
+        config.fps = mode.fps;
     }
 }
 
@@ -164,6 +175,50 @@ pub(super) fn fps_from_interval(numerator: u32, denominator: u32) -> Option<u32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_preview_settings_survive_camera_mode_selection() {
+        let mut config = Config {
+            width: 640,
+            height: 360,
+            width_set: true,
+            height_set: true,
+            fps: 15,
+            fps_set: true,
+            ..Config::default()
+        };
+        let mode = CameraMode {
+            format: "MJPG".to_string(),
+            width: 1920,
+            height: 1080,
+            fps: 30,
+        };
+
+        apply_camera_mode(&mut config, &mode);
+
+        assert_eq!(config.width, 640);
+        assert_eq!(config.height, 360);
+        assert_eq!(config.fps, 15);
+        assert_eq!(config.input_format.as_deref(), Some("mjpeg"));
+    }
+
+    #[test]
+    fn unspecified_preview_settings_follow_best_camera_mode() {
+        let mut config = Config::default();
+        let mode = CameraMode {
+            format: "MJPG".to_string(),
+            width: 1920,
+            height: 1080,
+            fps: 30,
+        };
+
+        apply_camera_mode(&mut config, &mode);
+
+        assert_eq!(config.width, 1920);
+        assert_eq!(config.height, 1080);
+        assert_eq!(config.fps, 30);
+        assert_eq!(config.input_format.as_deref(), Some("mjpeg"));
+    }
 
     #[test]
     fn best_camera_mode_prefers_largest_mjpg_mode() {

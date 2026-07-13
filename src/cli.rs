@@ -27,12 +27,15 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Config> {
             }
             "-w" | "--width" => {
                 config.width = parse_positive_arg(&arg, args.next())?;
+                config.width_set = true;
             }
             "-h" | "--height" => {
                 config.height = parse_positive_arg(&arg, args.next())?;
+                config.height_set = true;
             }
             "-f" | "--fps" => {
                 config.fps = parse_positive_arg(&arg, args.next())?;
+                config.fps_set = true;
             }
             "--camera-dir" => {
                 let value = args
@@ -104,6 +107,26 @@ mod tests {
             .expect("high preview fps should be accepted");
 
         assert_eq!(config.fps, 240);
+        assert!(config.fps_set);
+    }
+
+    #[test]
+    fn width_height_flags_mark_preview_dimensions_explicit() {
+        let config = parse_args(
+            [
+                "--width".to_string(),
+                "640".to_string(),
+                "--height".to_string(),
+                "360".to_string(),
+            ]
+            .into_iter(),
+        )
+        .expect("preview dimensions should parse");
+
+        assert_eq!(config.width, 640);
+        assert_eq!(config.height, 360);
+        assert!(config.width_set);
+        assert!(config.height_set);
     }
 
     #[test]

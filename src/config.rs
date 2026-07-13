@@ -31,7 +31,10 @@ pub(crate) struct Config {
     pub(crate) device: String,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) width_set: bool,
+    pub(crate) height_set: bool,
     pub(crate) fps: u32,
+    pub(crate) fps_set: bool,
     pub(crate) input_format: Option<String>,
     pub(crate) preview_backend: PreviewBackend,
     pub(crate) force: bool,
@@ -48,7 +51,10 @@ impl Default for Config {
             device: DEFAULT_DEVICE.to_string(),
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
+            width_set: false,
+            height_set: false,
             fps: DEFAULT_FPS,
+            fps_set: false,
             input_format: None,
             preview_backend: PreviewBackend::Auto,
             force: false,
@@ -104,9 +110,18 @@ fn apply_config_text(config: &mut Config, text: &str) -> Result<()> {
 
         match key {
             "device" => config.device = parse_config_string(value, line_number, key)?,
-            "width" => config.width = parse_config_u32(value, line_number, key)?,
-            "height" => config.height = parse_config_u32(value, line_number, key)?,
-            "fps" => config.fps = parse_config_u32(value, line_number, key)?,
+            "width" => {
+                config.width = parse_config_u32(value, line_number, key)?;
+                config.width_set = true;
+            }
+            "height" => {
+                config.height = parse_config_u32(value, line_number, key)?;
+                config.height_set = true;
+            }
+            "fps" => {
+                config.fps = parse_config_u32(value, line_number, key)?;
+                config.fps_set = true;
+            }
             "preview_backend" => {
                 config.preview_backend = parse_preview_backend(value, line_number, key)?;
             }
@@ -237,7 +252,10 @@ mod tests {
         assert_eq!(config.device, "/dev/video1");
         assert_eq!(config.width, 800);
         assert_eq!(config.height, 450);
+        assert!(config.width_set);
+        assert!(config.height_set);
         assert_eq!(config.fps, 60);
+        assert!(config.fps_set);
         assert_eq!(config.preview_backend, PreviewBackend::V4l2);
         assert_eq!(config.camera_dir, PathBuf::from("/tmp/camera"));
         assert!(!config.audio);

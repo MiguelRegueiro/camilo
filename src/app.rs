@@ -10,7 +10,7 @@ use crate::{
     capture::{
         CameraFrameStatus, CameraStream, CaptureThumbnail, RecordingWriteStatus, THUMBNAIL_SIZE,
         VideoRecording, apply_best_camera_mode, audio_input_available, frame_len,
-        latest_capture_thumbnail, latest_image_path, save_capture, square_thumbnail,
+        latest_capture_thumbnail, latest_image_path, resize_rgb24, save_capture, square_thumbnail,
     },
     cli,
     config::PreviewBackend,
@@ -18,9 +18,10 @@ use crate::{
         CaptureMode, KITTY_IMAGE_IDS, KITTY_NO_MIC_IMAGE_ID, KITTY_PLACEMENT_ID,
         KITTY_THUMBNAIL_IMAGE_IDS, KITTY_THUMBNAIL_PLACEMENT_ID, KITTY_TIMER_IMAGE_ID,
         KittyFramePlacement, TerminalGuard, clear_screen_and_images, drain_input_events,
-        draw_sidebar, enable_tmux_passthrough, inside_tmux, looks_like_kitty, spawn_input_thread,
-        ui_layout, write_kitty_delete_image, write_kitty_mode_pill, write_kitty_no_mic_pill,
-        write_kitty_recording_timer, write_kitty_rgb_frame, write_kitty_shutter_button,
+        draw_sidebar, enable_tmux_passthrough, image_area_pixel_size, inside_tmux,
+        looks_like_kitty, spawn_input_thread, ui_layout, write_kitty_delete_image,
+        write_kitty_mode_pill, write_kitty_no_mic_pill, write_kitty_recording_timer,
+        write_kitty_rgb_frame, write_kitty_shutter_button,
     },
 };
 
@@ -64,14 +65,19 @@ pub(crate) fn run() -> Result<()> {
         return Ok(());
     }
 
-    let frame_len = frame_len(config.width, config.height)?;
-    let mut frame = vec![0_u8; frame_len];
+    let camera_frame_len = frame_len(config.width, config.height)?;
+    let mut frame = vec![0_u8; camera_frame_len];
 
     let _terminal = TerminalGuard::enter()?;
     let stop_rx = spawn_input_thread();
     let stdout = io::stdout();
-    let mut out = BufWriter::with_capacity(frame_len + frame_len / 2, stdout.lock());
-    let mut kitty_sequence = Vec::with_capacity(frame_len + frame_len / 2 + 4096);
+    let mut out = BufWriter::with_capacity(camera_frame_len + camera_frame_len / 2, stdout.lock());
+    let mut kitty_sequence = Vec::with_capacity(camera_frame_len + camera_frame_len / 2 + 4096);
+    let mut layout = ui_layout(config.width, config.height);
+    let mut layout_dirty = true;
+    let mut preview_frame = Vec::new();
+    let mut preview_width = config.width;
+    let mut preview_height = config.height;
     let mut last_layout = None;
     let mut capture_mode = CaptureMode::Photo;
     let mut chrome_dirty = true;
@@ -99,6 +105,7 @@ pub(crate) fn run() -> Result<()> {
             recording.is_some(),
             &mut capture_requested,
             &mut chrome_dirty,
+            &mut layout_dirty,
         ) {
             break;
         }
@@ -133,6 +140,7 @@ pub(crate) fn run() -> Result<()> {
             recording.is_some(),
             &mut capture_requested,
             &mut chrome_dirty,
+            &mut layout_dirty,
         ) {
             break;
         }
@@ -141,17 +149,28 @@ pub(crate) fn run() -> Result<()> {
             write_due_recording_frames(recording, &config, &frame, Instant::now())?;
         }
 
-        let layout = ui_layout(config.width, config.height);
-        if last_layout != Some(layout) {
-            clear_screen_and_images(&mut out)?;
-            draw_sidebar(&mut out, layout)?;
+        if layout_dirty {
+            let next_layout = ui_layout(config.width, config.height);
+            if last_layout != Some(next_layout) {
+                clear_screen_and_images(&mut out)?;
+                draw_sidebar(&mut out, next_layout)?;
+                previous_image_id = None;
+                previous_thumbnail_image_id = None;
+                frame_serial = 0;
+                thumbnail_dirty = true;
+                chrome_dirty = true;
+                no_mic_visible = false;
+            }
+            layout = next_layout;
             last_layout = Some(layout);
-            previous_image_id = None;
-            previous_thumbnail_image_id = None;
-            frame_serial = 0;
-            thumbnail_dirty = true;
-            chrome_dirty = true;
-            no_mic_visible = false;
+            (preview_width, preview_height) = image_area_pixel_size(layout.preview_area);
+            preview_width = preview_width.min(config.width).max(1);
+            preview_height = preview_height.min(config.height).max(1);
+            let preview_len = frame_len(preview_width, preview_height)?;
+            if preview_frame.len() != preview_len {
+                preview_frame.resize(preview_len, 0);
+            }
+            layout_dirty = false;
         }
 
         if chrome_dirty {
@@ -243,6 +262,20 @@ pub(crate) fn run() -> Result<()> {
         }
 
         let image_id = KITTY_IMAGE_IDS[(frame_serial as usize) % KITTY_IMAGE_IDS.len()];
+        let (display_frame, display_width, display_height) =
+            if preview_width == config.width && preview_height == config.height {
+                (frame.as_slice(), config.width, config.height)
+            } else {
+                resize_rgb24(
+                    &frame,
+                    config.width,
+                    config.height,
+                    &mut preview_frame,
+                    preview_width,
+                    preview_height,
+                )?;
+                (preview_frame.as_slice(), preview_width, preview_height)
+            };
         write_kitty_rgb_frame(
             &mut out,
             KittyFramePlacement {
@@ -250,11 +283,11 @@ pub(crate) fn run() -> Result<()> {
                 placement_id: KITTY_PLACEMENT_ID,
                 z_index: 0,
                 previous_image_id,
-                width: config.width,
-                height: config.height,
+                width: display_width,
+                height: display_height,
                 area: layout.preview_area,
             },
-            &frame,
+            display_frame,
             &mut kitty_sequence,
         )?;
         previous_image_id = Some(image_id);

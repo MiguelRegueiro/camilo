@@ -187,6 +187,66 @@ pub(super) fn mirror_rgb24_in_place(frame: &mut [u8], width: u32, height: u32) {
     }
 }
 
+pub(crate) fn resize_rgb24(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst: &mut [u8],
+    dst_width: u32,
+    dst_height: u32,
+) -> Result<()> {
+    let expected_src = frame_len(src_width, src_height)?;
+    let expected_dst = frame_len(dst_width, dst_height)?;
+    if src.len() != expected_src || dst.len() != expected_dst {
+        return Err(anyhow!(
+            "resize buffers have {}/{} bytes, expected {expected_src}/{expected_dst}",
+            src.len(),
+            dst.len()
+        ));
+    }
+    if src_width == dst_width && src_height == dst_height {
+        dst.copy_from_slice(src);
+        return Ok(());
+    }
+
+    let x_scale = f64::from(src_width) / f64::from(dst_width.max(1));
+    let y_scale = f64::from(src_height) / f64::from(dst_height.max(1));
+    let src_width = src_width as usize;
+    let src_height = src_height as usize;
+    let dst_width = dst_width as usize;
+    let dst_height = dst_height as usize;
+
+    for y in 0..dst_height {
+        let src_y = ((y as f64 + 0.5) * y_scale - 0.5).clamp(0.0, (src_height - 1) as f64);
+        let y0 = src_y.floor() as usize;
+        let y1 = (y0 + 1).min(src_height - 1);
+        let y_weight = src_y - y0 as f64;
+        for x in 0..dst_width {
+            let src_x = ((x as f64 + 0.5) * x_scale - 0.5).clamp(0.0, (src_width - 1) as f64);
+            let x0 = src_x.floor() as usize;
+            let x1 = (x0 + 1).min(src_width - 1);
+            let x_weight = src_x - x0 as f64;
+            let dst_offset = (y * dst_width + x) * RAW_RGB_BYTES_PER_PIXEL;
+
+            for channel in 0..RAW_RGB_BYTES_PER_PIXEL {
+                let top_left =
+                    src[(y0 * src_width + x0) * RAW_RGB_BYTES_PER_PIXEL + channel] as f64;
+                let top_right =
+                    src[(y0 * src_width + x1) * RAW_RGB_BYTES_PER_PIXEL + channel] as f64;
+                let bottom_left =
+                    src[(y1 * src_width + x0) * RAW_RGB_BYTES_PER_PIXEL + channel] as f64;
+                let bottom_right =
+                    src[(y1 * src_width + x1) * RAW_RGB_BYTES_PER_PIXEL + channel] as f64;
+                let top = top_left + (top_right - top_left) * x_weight;
+                let bottom = bottom_left + (bottom_right - bottom_left) * x_weight;
+                dst[dst_offset + channel] = (top + (bottom - top) * y_weight).round() as u8;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

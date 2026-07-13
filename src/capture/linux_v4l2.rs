@@ -149,7 +149,7 @@ fn store_v4l2_next_frame(
     stream: &mut v4l::io::mmap::Stream<'_>,
     config: V4l2FrameConfig,
     latest_frame: &Arc<Mutex<LatestCameraFrame>>,
-    buffer: &mut [u8],
+    buffer: &mut Vec<u8>,
 ) -> io::Result<Vec<u8>> {
     use v4l::io::traits::CaptureStream;
 
@@ -168,7 +168,7 @@ fn store_v4l2_next_frame(
     }
     Ok(store_latest_frame(
         latest_frame,
-        buffer.to_vec(),
+        std::mem::take(buffer),
         config.frame_len,
     ))
 }

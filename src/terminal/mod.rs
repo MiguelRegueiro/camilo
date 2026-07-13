@@ -13,7 +13,7 @@ pub(crate) use kitty_graphics::{
     KITTY_THUMBNAIL_PLACEMENT_ID, KITTY_TIMER_IMAGE_ID, KittyFramePlacement,
     clear_screen_and_images, write_kitty_delete_image, write_kitty_rgb_frame,
 };
-pub(crate) use layout::ui_layout;
+pub(crate) use layout::{image_area_pixel_size, ui_layout};
 pub(crate) use session::TerminalGuard;
 pub(crate) use widgets::{
     draw_sidebar, write_kitty_mode_pill, write_kitty_no_mic_pill, write_kitty_recording_timer,

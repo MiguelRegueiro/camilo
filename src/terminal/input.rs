@@ -23,6 +23,7 @@ impl CaptureMode {
 pub(crate) enum InputEvent {
     Quit,
     Click { x: u16, y: u16 },
+    Resize,
 }
 
 pub(crate) fn spawn_input_thread() -> mpsc::Receiver<InputEvent> {
@@ -47,6 +48,11 @@ pub(crate) fn spawn_input_thread() -> mpsc::Receiver<InputEvent> {
                         break;
                     }
                 }
+                Ok(Event::Resize(_, _)) => {
+                    if tx.send(InputEvent::Resize).is_err() {
+                        break;
+                    }
+                }
                 Ok(_) => {}
                 Err(_) => {
                     let _ = tx.send(InputEvent::Quit);
@@ -65,11 +71,13 @@ pub(crate) fn drain_input_events(
     mode_locked: bool,
     capture_requested: &mut bool,
     chrome_dirty: &mut bool,
+    layout_dirty: &mut bool,
 ) -> bool {
     let mut should_quit = false;
     while let Ok(event) = rx.try_recv() {
         match event {
             InputEvent::Quit => should_quit = true,
+            InputEvent::Resize => *layout_dirty = true,
             InputEvent::Click { x, y } => {
                 if layout
                     .and_then(|layout| layout.capture_button)
@@ -101,6 +109,7 @@ mod tests {
         let mut mode = CaptureMode::Photo;
         let mut capture_requested = false;
         let mut chrome_dirty = false;
+        let mut layout_dirty = false;
         let layout = UiLayout {
             preview_area: ImageArea {
                 x: 0,
@@ -137,6 +146,7 @@ mod tests {
             false,
             &mut capture_requested,
             &mut chrome_dirty,
+            &mut layout_dirty,
         ));
         assert_eq!(mode, CaptureMode::Video);
         assert!(!capture_requested);

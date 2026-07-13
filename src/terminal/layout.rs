@@ -98,6 +98,17 @@ pub(crate) fn ui_layout(source_width: u32, source_height: u32) -> UiLayout {
     }
 }
 
+pub(crate) fn image_area_pixel_size(area: ImageArea) -> (u32, u32) {
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let (pixel_width, pixel_height) = terminal_pixel_size(cols, rows);
+    let cell_width = f64::from(pixel_width) / f64::from(cols.max(1));
+    let cell_height = f64::from(pixel_height) / f64::from(rows.max(1));
+    (
+        ((f64::from(area.cols.max(1)) * cell_width).round() as u32).max(1),
+        ((f64::from(area.rows.max(1)) * cell_height).round() as u32).max(1),
+    )
+}
+
 fn fit_image_area(
     source_width: u32,
     source_height: u32,

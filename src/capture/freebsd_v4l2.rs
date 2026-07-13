@@ -677,7 +677,7 @@ fn store_next_frame(
     stream: &mut MmapStream,
     config: V4l2FrameConfig,
     latest_frame: &Arc<Mutex<LatestCameraFrame>>,
-    buffer: &mut [u8],
+    buffer: &mut Vec<u8>,
     timeout: Duration,
 ) -> io::Result<Vec<u8>> {
     let (frame, index) = stream.next_frame(timeout)?;
@@ -696,7 +696,7 @@ fn store_next_frame(
     }
     Ok(store_latest_frame(
         latest_frame,
-        buffer.to_vec(),
+        std::mem::take(buffer),
         config.frame_len,
     ))
 }

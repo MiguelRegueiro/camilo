@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64_simd::{Out, STANDARD as BASE64};
 
 use super::{env::inside_tmux, layout::ImageArea};
 
@@ -77,8 +77,8 @@ pub(super) fn write_kitty_image(
         let end = (offset + KITTY_RAW_CHUNK_BYTES).min(frame.len());
         let more = end < frame.len();
         let encoded_len = BASE64
-            .encode_slice(&frame[offset..end], &mut encoded)
-            .map_err(io::Error::other)?;
+            .encode(&frame[offset..end], Out::from_slice(&mut encoded))
+            .len();
         if first {
             write!(
                 sequence,

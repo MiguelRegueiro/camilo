@@ -75,7 +75,10 @@ impl CameraStream {
         }
     }
 
-    pub(crate) fn read_latest_frame(&mut self, frame: &mut [u8]) -> io::Result<CameraFrameStatus> {
+    pub(crate) fn read_latest_frame(
+        &mut self,
+        frame: &mut Vec<u8>,
+    ) -> io::Result<CameraFrameStatus> {
         match self {
             Self::Ffmpeg(stream) => stream.read_latest_frame(frame),
             Self::V4l2(stream) => stream.read_latest_frame(frame),
@@ -159,7 +162,7 @@ impl FfmpegCameraStream {
         })
     }
 
-    fn read_latest_frame(&mut self, frame: &mut [u8]) -> io::Result<CameraFrameStatus> {
+    fn read_latest_frame(&mut self, frame: &mut Vec<u8>) -> io::Result<CameraFrameStatus> {
         read_latest_stored_frame(&self.latest_frame, &mut self.delivered_serial, frame)
     }
 
@@ -230,7 +233,7 @@ impl V4l2CameraStream {
         }
     }
 
-    fn read_latest_frame(&mut self, frame: &mut [u8]) -> io::Result<CameraFrameStatus> {
+    fn read_latest_frame(&mut self, frame: &mut Vec<u8>) -> io::Result<CameraFrameStatus> {
         read_latest_stored_frame(&self.latest_frame, &mut self.delivered_serial, frame)
     }
 
@@ -258,13 +261,13 @@ impl Drop for V4l2CameraStream {
 fn read_latest_stored_frame(
     latest_frame: &Arc<Mutex<LatestCameraFrame>>,
     delivered_serial: &mut u64,
-    frame: &mut [u8],
+    frame: &mut Vec<u8>,
 ) -> io::Result<CameraFrameStatus> {
     let mut state = latest_frame
         .lock()
         .map_err(|_| io::Error::other("camera frame state is poisoned"))?;
     if state.serial != *delivered_serial {
-        let Some(latest_frame) = state.frame.as_ref() else {
+        let Some(latest_frame) = state.frame.as_mut() else {
             return Ok(CameraFrameStatus::NoFrame);
         };
         if latest_frame.len() != frame.len() {
@@ -277,7 +280,7 @@ fn read_latest_stored_frame(
                 ),
             ));
         }
-        frame.copy_from_slice(latest_frame);
+        std::mem::swap(frame, latest_frame);
         *delivered_serial = state.serial;
         Ok(CameraFrameStatus::NewFrame)
     } else if let Some(error) = state.error.take() {
@@ -395,5 +398,23 @@ mod tests {
         let state = state.lock().expect("state should lock");
         assert_eq!(state.frame, Some(vec![2, 2, 2]));
         assert_eq!(state.serial, 2);
+    }
+
+    #[test]
+    fn latest_frame_read_swaps_buffers_without_copying() {
+        let state = Arc::new(Mutex::new(LatestCameraFrame::default()));
+        let mut delivered_serial = 0;
+        let mut app_frame = vec![1, 1, 1];
+
+        let stored = store_latest_frame(&state, vec![2, 2, 2], 3);
+        assert_eq!(stored, vec![0, 0, 0]);
+
+        let status = read_latest_stored_frame(&state, &mut delivered_serial, &mut app_frame)
+            .expect("latest frame should read");
+
+        assert_eq!(status, CameraFrameStatus::NewFrame);
+        assert_eq!(app_frame, vec![2, 2, 2]);
+        let state = state.lock().expect("state should lock");
+        assert_eq!(state.frame, Some(vec![1, 1, 1]));
     }
 }

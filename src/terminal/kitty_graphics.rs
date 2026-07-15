@@ -11,12 +11,16 @@ pub(crate) const KITTY_SHUTTER_IMAGE_ID: u32 = KITTY_IMAGE_ID + 20;
 pub(crate) const KITTY_MODE_IMAGE_ID: u32 = KITTY_IMAGE_ID + 30;
 pub(crate) const KITTY_TIMER_IMAGE_ID: u32 = KITTY_IMAGE_ID + 40;
 pub(crate) const KITTY_NO_MIC_IMAGE_ID: u32 = KITTY_IMAGE_ID + 50;
+pub(crate) const KITTY_SELF_TIMER_IMAGE_ID: u32 = KITTY_IMAGE_ID + 60;
+pub(crate) const KITTY_COUNTDOWN_IMAGE_ID: u32 = KITTY_IMAGE_ID + 70;
 pub(crate) const KITTY_PLACEMENT_ID: u32 = 1;
 pub(crate) const KITTY_THUMBNAIL_PLACEMENT_ID: u32 = 2;
 pub(crate) const KITTY_SHUTTER_PLACEMENT_ID: u32 = 3;
 pub(crate) const KITTY_MODE_PLACEMENT_ID: u32 = 4;
 pub(crate) const KITTY_TIMER_PLACEMENT_ID: u32 = 5;
 pub(crate) const KITTY_NO_MIC_PLACEMENT_ID: u32 = 6;
+pub(crate) const KITTY_SELF_TIMER_PLACEMENT_ID: u32 = 7;
+pub(crate) const KITTY_COUNTDOWN_PLACEMENT_ID: u32 = 8;
 const KITTY_RAW_CHUNK_BYTES: usize = 3 * 4096 / 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

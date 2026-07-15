@@ -1,11 +1,13 @@
 use std::{io, io::Write};
 
 use super::{
-    input::CaptureMode,
+    input::{CaptureMode, SelfTimer},
     kitty_graphics::{
-        KITTY_MODE_IMAGE_ID, KITTY_MODE_PLACEMENT_ID, KITTY_NO_MIC_IMAGE_ID,
-        KITTY_NO_MIC_PLACEMENT_ID, KITTY_SHUTTER_IMAGE_ID, KITTY_SHUTTER_PLACEMENT_ID,
-        KITTY_TIMER_IMAGE_ID, KITTY_TIMER_PLACEMENT_ID, KittyFramePlacement, write_kitty_image,
+        KITTY_COUNTDOWN_IMAGE_ID, KITTY_COUNTDOWN_PLACEMENT_ID, KITTY_MODE_IMAGE_ID,
+        KITTY_MODE_PLACEMENT_ID, KITTY_NO_MIC_IMAGE_ID, KITTY_NO_MIC_PLACEMENT_ID,
+        KITTY_SELF_TIMER_IMAGE_ID, KITTY_SELF_TIMER_PLACEMENT_ID, KITTY_SHUTTER_IMAGE_ID,
+        KITTY_SHUTTER_PLACEMENT_ID, KITTY_TIMER_IMAGE_ID, KITTY_TIMER_PLACEMENT_ID,
+        KittyFramePlacement, write_kitty_image,
     },
     layout::{ImageArea, UiLayout},
     raster::*,
@@ -14,14 +16,20 @@ use super::{
 const SHUTTER_SIZE: u32 = 128;
 const MODE_PILL_WIDTH: u32 = 128;
 const MODE_PILL_HEIGHT: u32 = 160;
+const SELF_TIMER_WIDTH: u32 = 128;
+const SELF_TIMER_HEIGHT: u32 = 96;
 const RECORDING_TIMER_WIDTH: u32 = 224;
 const RECORDING_TIMER_HEIGHT: u32 = 48;
 const NO_MIC_PILL_WIDTH: u32 = 72;
 const NO_MIC_PILL_HEIGHT: u32 = 48;
+const COUNTDOWN_WIDTH: u32 = 128;
+const COUNTDOWN_HEIGHT: u32 = 96;
 const SHUTTER_Z_INDEX: i32 = 1_000_000_001;
 const MODE_PILL_Z_INDEX: i32 = 1_000_000_002;
 const TIMER_Z_INDEX: i32 = 1_000_000_003;
 const NO_MIC_Z_INDEX: i32 = 1_000_000_004;
+const SELF_TIMER_Z_INDEX: i32 = 1_000_000_005;
+const COUNTDOWN_Z_INDEX: i32 = 1_000_000_006;
 
 pub(crate) fn draw_sidebar(out: &mut impl Write, layout: UiLayout) -> io::Result<()> {
     if layout.sidebar.cols == 0 {
@@ -72,6 +80,54 @@ pub(crate) fn write_kitty_mode_pill(
             previous_image_id: None,
             width: MODE_PILL_WIDTH,
             height: MODE_PILL_HEIGHT,
+            area,
+        },
+        &frame,
+        32,
+        sequence,
+    )
+}
+
+pub(crate) fn write_kitty_self_timer_button(
+    out: &mut impl Write,
+    area: ImageArea,
+    timer: SelfTimer,
+    sequence: &mut Vec<u8>,
+) -> io::Result<()> {
+    let frame = self_timer_button_rgba(SELF_TIMER_WIDTH, SELF_TIMER_HEIGHT, timer);
+    write_kitty_image(
+        out,
+        KittyFramePlacement {
+            image_id: KITTY_SELF_TIMER_IMAGE_ID,
+            placement_id: KITTY_SELF_TIMER_PLACEMENT_ID,
+            z_index: SELF_TIMER_Z_INDEX,
+            previous_image_id: None,
+            width: SELF_TIMER_WIDTH,
+            height: SELF_TIMER_HEIGHT,
+            area,
+        },
+        &frame,
+        32,
+        sequence,
+    )
+}
+
+pub(crate) fn write_kitty_countdown(
+    out: &mut impl Write,
+    area: ImageArea,
+    remaining_seconds: u64,
+    sequence: &mut Vec<u8>,
+) -> io::Result<()> {
+    let frame = countdown_rgba(COUNTDOWN_WIDTH, COUNTDOWN_HEIGHT, remaining_seconds);
+    write_kitty_image(
+        out,
+        KittyFramePlacement {
+            image_id: KITTY_COUNTDOWN_IMAGE_ID,
+            placement_id: KITTY_COUNTDOWN_PLACEMENT_ID,
+            z_index: COUNTDOWN_Z_INDEX,
+            previous_image_id: None,
+            width: COUNTDOWN_WIDTH,
+            height: COUNTDOWN_HEIGHT,
             area,
         },
         &frame,
@@ -195,6 +251,210 @@ fn no_mic_pill_rgba(width: u32, height: u32) -> Vec<u8> {
         },
     );
     frame
+}
+
+fn self_timer_button_rgba(width: u32, height: u32, timer: SelfTimer) -> Vec<u8> {
+    let mut frame = vec![0_u8; (width * height * 4) as usize];
+    let active = timer != SelfTimer::Off;
+    let icon_color = if active {
+        [250, 250, 250]
+    } else {
+        [161, 161, 170]
+    };
+    fill_rounded_rect(
+        &mut frame,
+        width,
+        height,
+        RoundedRect {
+            x: 8.0,
+            y: 10.0,
+            width: f64::from(width - 16),
+            height: f64::from(height - 20),
+            radius: 25.0,
+        },
+        [24, 24, 27],
+        if active { 190 } else { 158 },
+    );
+    draw_stopwatch_glyph(&mut frame, width, height, icon_color, active);
+
+    if let Some(seconds) = timer.seconds() {
+        draw_timer_badge(&mut frame, width, height, seconds);
+    }
+
+    frame
+}
+
+fn countdown_rgba(width: u32, height: u32, remaining_seconds: u64) -> Vec<u8> {
+    let mut frame = vec![0_u8; (width * height * 4) as usize];
+    fill_rounded_rect(
+        &mut frame,
+        width,
+        height,
+        RoundedRect {
+            x: 12.0,
+            y: 8.0,
+            width: f64::from(width - 24),
+            height: f64::from(height - 16),
+            radius: 34.0,
+        },
+        [24, 24, 27],
+        176,
+    );
+    let digit = remaining_seconds.clamp(1, 9) as u8;
+    draw_large_digit(&mut frame, width, height, digit);
+    frame
+}
+
+fn draw_stopwatch_glyph(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    color: [u8; 3],
+    leave_room_for_number: bool,
+) {
+    let center_x = f64::from(width) / 2.0 - if leave_room_for_number { 5.0 } else { 0.0 };
+    let center_y = f64::from(height) / 2.0;
+    fill_ellipse(
+        frame,
+        width,
+        height,
+        Ellipse {
+            x: center_x,
+            y: center_y,
+            radius_x: 22.0,
+            radius_y: 18.5,
+        },
+        color,
+        230,
+    );
+    fill_ellipse(
+        frame,
+        width,
+        height,
+        Ellipse {
+            x: center_x,
+            y: center_y,
+            radius_x: 16.0,
+            radius_y: 13.2,
+        },
+        [24, 24, 27],
+        245,
+    );
+    fill_rounded_rect(
+        frame,
+        width,
+        height,
+        RoundedRect {
+            x: center_x - 5.5,
+            y: center_y - 27.0,
+            width: 11.0,
+            height: 6.0,
+            radius: 3.0,
+        },
+        color,
+        230,
+    );
+    draw_soft_line(
+        frame,
+        width,
+        height,
+        SoftLine {
+            from: (center_x, center_y),
+            to: (center_x + 8.0, center_y - 7.5),
+            radius: 2.0,
+            color,
+            alpha: 230,
+        },
+    );
+    draw_soft_line(
+        frame,
+        width,
+        height,
+        SoftLine {
+            from: (center_x, center_y),
+            to: (center_x, center_y - 10.0),
+            radius: 1.7,
+            color,
+            alpha: 200,
+        },
+    );
+}
+
+fn draw_timer_badge(frame: &mut [u8], width: u32, height: u32, seconds: u64) {
+    let text = seconds.to_string();
+    let x = if seconds >= 10 {
+        width.saturating_sub(46)
+    } else {
+        width.saturating_sub(36)
+    };
+    let y = height.saturating_sub(45);
+    draw_timer_text(frame, width, height, x, y, &text);
+}
+
+fn draw_large_digit(frame: &mut [u8], width: u32, height: u32, digit: u8) {
+    const DIGITS: [u32; 10] = [
+        0b111_101_101_101_101_101_111,
+        0b010_110_010_010_010_010_111,
+        0b111_001_001_111_100_100_111,
+        0b111_001_001_111_001_001_111,
+        0b101_101_101_111_001_001_001,
+        0b111_100_100_111_001_001_111,
+        0b111_100_100_111_101_101_111,
+        0b111_001_001_010_010_010_010,
+        0b111_101_101_111_101_101_111,
+        0b111_101_101_111_001_001_111,
+    ];
+    let Some(mask) = DIGITS.get(digit as usize).copied() else {
+        return;
+    };
+    let block_w = 11;
+    let block_h = 7;
+    let gap = 3;
+    let total_w = 3 * block_w + 2 * gap;
+    let total_h = 7 * block_h + 6 * gap;
+    let start_x = width.saturating_sub(total_w) / 2;
+    let start_y = height.saturating_sub(total_h) / 2;
+    for row in 0..7 {
+        for col in 0..3 {
+            let bit = 20 - (row * 3 + col);
+            if (mask & (1 << bit)) != 0 {
+                fill_digit_block(
+                    frame,
+                    width,
+                    height,
+                    start_x + col * (block_w + gap),
+                    start_y + row * (block_h + gap),
+                    block_w,
+                    block_h,
+                );
+            }
+        }
+    }
+}
+
+fn fill_digit_block(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    cols: u32,
+    rows: u32,
+) {
+    fill_rounded_rect(
+        frame,
+        width,
+        height,
+        RoundedRect {
+            x: f64::from(x),
+            y: f64::from(y),
+            width: f64::from(cols),
+            height: f64::from(rows),
+            radius: 2.5,
+        },
+        [250, 250, 250],
+        232,
+    );
 }
 
 fn draw_mic_glyph(frame: &mut [u8], width: u32, height: u32, color: [u8; 3]) {
@@ -420,12 +680,12 @@ fn mode_pill_rgba(width: u32, height: u32, capture_mode: CaptureMode) -> Vec<u8>
         radius: 23.0,
     };
 
-    fill_rounded_rect(&mut frame, width, height, outer, [24, 24, 27], 138);
+    fill_rounded_rect(&mut frame, width, height, outer, [24, 24, 27], 178);
     let selected = match capture_mode {
         CaptureMode::Photo => top_item,
         CaptureMode::Video => bottom_item,
     };
-    fill_rounded_rect(&mut frame, width, height, selected, [63, 63, 70], 205);
+    fill_rounded_rect(&mut frame, width, height, selected, [63, 63, 70], 224);
 
     let photo_color = if capture_mode == CaptureMode::Photo {
         [250, 250, 250]

@@ -15,13 +15,14 @@ use crate::{
     cli,
     config::PreviewBackend,
     terminal::{
-        CaptureMode, KITTY_IMAGE_IDS, KITTY_NO_MIC_IMAGE_ID, KITTY_PLACEMENT_ID,
-        KITTY_THUMBNAIL_IMAGE_IDS, KITTY_THUMBNAIL_PLACEMENT_ID, KITTY_TIMER_IMAGE_ID,
-        KittyFramePlacement, TerminalGuard, clear_screen_and_images, drain_input_events,
-        draw_sidebar, enable_tmux_passthrough, image_area_pixel_size, inside_tmux,
-        looks_like_kitty, spawn_input_thread, ui_layout, write_kitty_delete_image,
+        CaptureMode, InputTargets, KITTY_COUNTDOWN_IMAGE_ID, KITTY_IMAGE_IDS,
+        KITTY_NO_MIC_IMAGE_ID, KITTY_PLACEMENT_ID, KITTY_THUMBNAIL_IMAGE_IDS,
+        KITTY_THUMBNAIL_PLACEMENT_ID, KITTY_TIMER_IMAGE_ID, KittyFramePlacement, SelfTimer,
+        TerminalGuard, clear_screen_and_images, drain_input_events, draw_sidebar,
+        enable_tmux_passthrough, image_area_pixel_size, inside_tmux, looks_like_kitty,
+        spawn_input_thread, ui_layout, write_kitty_countdown, write_kitty_delete_image,
         write_kitty_mode_pill, write_kitty_no_mic_pill, write_kitty_recording_timer,
-        write_kitty_rgb_frame, write_kitty_shutter_button,
+        write_kitty_rgb_frame, write_kitty_self_timer_button, write_kitty_shutter_button,
     },
 };
 
@@ -35,6 +36,19 @@ struct ActiveRecording {
 
 struct PendingRecordingStop {
     handle: thread::JoinHandle<Result<()>>,
+}
+
+#[derive(Clone, Copy)]
+enum PendingCaptureAction {
+    Photo,
+    StartRecording,
+}
+
+struct CountdownState {
+    started_at: Instant,
+    duration: Duration,
+    action: PendingCaptureAction,
+    last_visible_second: Option<u64>,
 }
 
 pub(crate) fn run() -> Result<()> {
@@ -80,6 +94,9 @@ pub(crate) fn run() -> Result<()> {
     let mut preview_height = config.height;
     let mut last_layout = None;
     let mut capture_mode = CaptureMode::Photo;
+    let mut self_timer = SelfTimer::Off;
+    let mut countdown: Option<CountdownState> = None;
+    let mut countdown_visible = false;
     let mut chrome_dirty = true;
     let mut previous_image_id = None;
     let mut previous_thumbnail_image_id = None;
@@ -101,11 +118,14 @@ pub(crate) fn run() -> Result<()> {
         if drain_input_events(
             &stop_rx,
             last_layout,
-            &mut capture_mode,
-            recording.is_some(),
-            &mut capture_requested,
-            &mut chrome_dirty,
-            &mut layout_dirty,
+            InputTargets {
+                capture_mode: &mut capture_mode,
+                self_timer: &mut self_timer,
+                controls_locked: recording.is_some() || countdown.is_some(),
+                capture_requested: &mut capture_requested,
+                chrome_dirty: &mut chrome_dirty,
+                layout_dirty: &mut layout_dirty,
+            },
         ) {
             break;
         }
@@ -136,11 +156,14 @@ pub(crate) fn run() -> Result<()> {
         if drain_input_events(
             &stop_rx,
             last_layout,
-            &mut capture_mode,
-            recording.is_some(),
-            &mut capture_requested,
-            &mut chrome_dirty,
-            &mut layout_dirty,
+            InputTargets {
+                capture_mode: &mut capture_mode,
+                self_timer: &mut self_timer,
+                controls_locked: recording.is_some() || countdown.is_some(),
+                capture_requested: &mut capture_requested,
+                chrome_dirty: &mut chrome_dirty,
+                layout_dirty: &mut layout_dirty,
+            },
         ) {
             break;
         }
@@ -160,6 +183,10 @@ pub(crate) fn run() -> Result<()> {
                 thumbnail_dirty = true;
                 chrome_dirty = true;
                 no_mic_visible = false;
+                countdown_visible = false;
+                if let Some(countdown) = countdown.as_mut() {
+                    countdown.last_visible_second = None;
+                }
             }
             layout = next_layout;
             last_layout = Some(layout);
@@ -186,54 +213,101 @@ pub(crate) fn run() -> Result<()> {
             if let Some(area) = layout.mode_pill_area {
                 write_kitty_mode_pill(&mut out, area, capture_mode, &mut kitty_sequence)?;
             }
+            if let Some(area) = layout.self_timer_area {
+                write_kitty_self_timer_button(&mut out, area, self_timer, &mut kitty_sequence)?;
+            }
             chrome_dirty = false;
         }
 
         if capture_requested {
-            match capture_mode {
-                CaptureMode::Photo => {
-                    let path = save_capture(&config, &frame)?;
-                    last_thumbnail = Some(CaptureThumbnail {
-                        path,
-                        frame: square_thumbnail(
-                            &frame,
-                            config.width,
-                            config.height,
-                            THUMBNAIL_SIZE,
-                        ),
-                    });
-                    thumbnail_dirty = true;
-                    next_thumbnail_rescan = Instant::now() + Duration::from_millis(750);
+            if countdown.is_some() {
+                countdown = None;
+                if countdown_visible {
+                    write_kitty_delete_image(&mut out, KITTY_COUNTDOWN_IMAGE_ID)?;
+                    countdown_visible = false;
                 }
-                CaptureMode::Video => {
-                    if let Some(recording) = recording.take() {
-                        pending_recording_stops.push(PendingRecordingStop {
-                            handle: recording.encoder.stop_async(),
-                        });
-                        write_kitty_delete_image(&mut out, KITTY_TIMER_IMAGE_ID)?;
-                        if no_mic_visible {
-                            write_kitty_delete_image(&mut out, KITTY_NO_MIC_IMAGE_ID)?;
-                            no_mic_visible = false;
-                        }
-                    } else {
-                        let encoder = if audio_available {
-                            VideoRecording::start(&config)?
+            } else {
+                match capture_mode {
+                    CaptureMode::Photo => {
+                        if let Some(seconds) = self_timer.seconds() {
+                            countdown = Some(CountdownState {
+                                started_at: Instant::now(),
+                                duration: Duration::from_secs(seconds),
+                                action: PendingCaptureAction::Photo,
+                                last_visible_second: None,
+                            });
                         } else {
-                            VideoRecording::start_without_audio(&config)?
-                        };
-                        let now = Instant::now();
-                        recording = Some(ActiveRecording {
-                            encoder,
-                            started_at: now,
-                            next_frame_at: now,
-                            frame_interval: recording_frame_interval(config.fps),
-                            last_timer_second: None,
-                        });
+                            take_photo(
+                                &config,
+                                &frame,
+                                &mut last_thumbnail,
+                                &mut thumbnail_dirty,
+                                &mut next_thumbnail_rescan,
+                            )?;
+                        }
                     }
-                    chrome_dirty = true;
+                    CaptureMode::Video => {
+                        if let Some(recording) = recording.take() {
+                            pending_recording_stops.push(PendingRecordingStop {
+                                handle: recording.encoder.stop_async(),
+                            });
+                            write_kitty_delete_image(&mut out, KITTY_TIMER_IMAGE_ID)?;
+                            if no_mic_visible {
+                                write_kitty_delete_image(&mut out, KITTY_NO_MIC_IMAGE_ID)?;
+                                no_mic_visible = false;
+                            }
+                        } else if let Some(seconds) = self_timer.seconds() {
+                            countdown = Some(CountdownState {
+                                started_at: Instant::now(),
+                                duration: Duration::from_secs(seconds),
+                                action: PendingCaptureAction::StartRecording,
+                                last_visible_second: None,
+                            });
+                        } else {
+                            recording = Some(start_recording(&config, audio_available)?);
+                        }
+                        chrome_dirty = true;
+                    }
                 }
             }
             capture_requested = false;
+        }
+
+        if let Some(state) = countdown.as_mut() {
+            let elapsed = state.started_at.elapsed();
+            if elapsed >= state.duration {
+                let action = state.action;
+                countdown = None;
+                if countdown_visible {
+                    write_kitty_delete_image(&mut out, KITTY_COUNTDOWN_IMAGE_ID)?;
+                    countdown_visible = false;
+                }
+                match action {
+                    PendingCaptureAction::Photo => {
+                        take_photo(
+                            &config,
+                            &frame,
+                            &mut last_thumbnail,
+                            &mut thumbnail_dirty,
+                            &mut next_thumbnail_rescan,
+                        )?;
+                    }
+                    PendingCaptureAction::StartRecording => {
+                        recording = Some(start_recording(&config, audio_available)?);
+                        chrome_dirty = true;
+                    }
+                }
+            } else if let Some(area) = layout.countdown_area {
+                let remaining = (state.duration - elapsed).as_secs_f64().ceil().max(1.0) as u64;
+                if state.last_visible_second != Some(remaining) {
+                    write_kitty_countdown(&mut out, area, remaining, &mut kitty_sequence)?;
+                    state.last_visible_second = Some(remaining);
+                    countdown_visible = true;
+                }
+            }
+        } else if countdown_visible {
+            write_kitty_delete_image(&mut out, KITTY_COUNTDOWN_IMAGE_ID)?;
+            countdown_visible = false;
         }
 
         if let (Some(recording), Some(area)) = (&mut recording, layout.recording_timer_area) {
@@ -373,6 +447,42 @@ fn finish_recording_stop(recording: PendingRecordingStop) -> Result<()> {
         .handle
         .join()
         .unwrap_or_else(|_| bail!("video recording finalizer panicked"))
+}
+
+fn take_photo(
+    config: &crate::config::Config,
+    frame: &[u8],
+    last_thumbnail: &mut Option<CaptureThumbnail>,
+    thumbnail_dirty: &mut bool,
+    next_thumbnail_rescan: &mut Instant,
+) -> Result<()> {
+    let path = save_capture(config, frame)?;
+    *last_thumbnail = Some(CaptureThumbnail {
+        path,
+        frame: square_thumbnail(frame, config.width, config.height, THUMBNAIL_SIZE),
+    });
+    *thumbnail_dirty = true;
+    *next_thumbnail_rescan = Instant::now() + Duration::from_millis(750);
+    Ok(())
+}
+
+fn start_recording(
+    config: &crate::config::Config,
+    audio_available: bool,
+) -> Result<ActiveRecording> {
+    let encoder = if audio_available {
+        VideoRecording::start(config)?
+    } else {
+        VideoRecording::start_without_audio(config)?
+    };
+    let now = Instant::now();
+    Ok(ActiveRecording {
+        encoder,
+        started_at: now,
+        next_frame_at: now,
+        frame_interval: recording_frame_interval(config.fps),
+        last_timer_second: None,
+    })
 }
 
 fn write_due_recording_frames(

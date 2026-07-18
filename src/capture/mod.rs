@@ -16,5 +16,5 @@ pub(crate) use latest_capture_thumbnail::{
     CaptureThumbnail, THUMBNAIL_SIZE, latest_capture_thumbnail, latest_image_path, square_thumbnail,
 };
 pub(crate) use photo_capture::save_capture;
-pub(crate) use rgb_frame::{frame_len, resize_rgb24};
+pub(crate) use rgb_frame::{Rgb24Scaler, frame_len};
 pub(crate) use video_recording::{RecordingWriteStatus, VideoRecording, audio_input_available};

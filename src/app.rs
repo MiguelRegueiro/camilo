@@ -8,9 +8,9 @@ use anyhow::{Result, bail};
 
 use crate::{
     capture::{
-        CameraFrameStatus, CameraStream, CaptureThumbnail, RecordingWriteStatus, THUMBNAIL_SIZE,
-        VideoRecording, apply_best_camera_mode, audio_input_available, frame_len,
-        latest_capture_thumbnail, latest_image_path, resize_rgb24, save_capture, square_thumbnail,
+        CameraFrameStatus, CameraStream, CaptureThumbnail, RecordingWriteStatus, Rgb24Scaler,
+        THUMBNAIL_SIZE, VideoRecording, apply_best_camera_mode, audio_input_available, frame_len,
+        latest_capture_thumbnail, latest_image_path, save_capture, square_thumbnail,
     },
     cli,
     config::PreviewBackend,
@@ -91,6 +91,7 @@ pub(crate) fn run() -> Result<()> {
     let mut layout = ui_layout(config.width, config.height);
     let mut layout_dirty = true;
     let mut preview_frame = Vec::new();
+    let mut preview_scaler = Rgb24Scaler::default();
     let mut preview_width = config.width;
     let mut preview_height = config.height;
     let mut last_layout = None;
@@ -344,7 +345,7 @@ pub(crate) fn run() -> Result<()> {
             if preview_width == config.width && preview_height == config.height {
                 (frame.as_slice(), config.width, config.height)
             } else {
-                resize_rgb24(
+                preview_scaler.resize(
                     &frame,
                     config.width,
                     config.height,

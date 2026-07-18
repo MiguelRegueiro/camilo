@@ -6,7 +6,9 @@ mod raster;
 mod session;
 mod widgets;
 
-pub(crate) use env::{enable_tmux_passthrough, inside_tmux, looks_like_kitty};
+pub(crate) use env::{
+    enable_tmux_passthrough, inside_tmux, looks_like_kitty, refresh_tmux_pane_origin,
+};
 pub(crate) use input::{
     CaptureMode, InputTargets, SelfTimer, drain_input_events, spawn_input_thread,
 };

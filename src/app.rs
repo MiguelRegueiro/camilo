@@ -20,9 +20,10 @@ use crate::{
         KITTY_THUMBNAIL_PLACEMENT_ID, KITTY_TIMER_IMAGE_ID, KittyFramePlacement, SelfTimer,
         TerminalGuard, clear_screen_and_images, drain_input_events, draw_sidebar,
         enable_tmux_passthrough, image_area_pixel_size, inside_tmux, looks_like_kitty,
-        spawn_input_thread, ui_layout, write_kitty_countdown, write_kitty_delete_image,
-        write_kitty_mode_pill, write_kitty_no_mic_pill, write_kitty_recording_timer,
-        write_kitty_rgb_frame, write_kitty_self_timer_button, write_kitty_shutter_button,
+        refresh_tmux_pane_origin, spawn_input_thread, ui_layout, write_kitty_countdown,
+        write_kitty_delete_image, write_kitty_mode_pill, write_kitty_no_mic_pill,
+        write_kitty_recording_timer, write_kitty_rgb_frame, write_kitty_self_timer_button,
+        write_kitty_shutter_button,
     },
 };
 
@@ -173,6 +174,9 @@ pub(crate) fn run() -> Result<()> {
         }
 
         if layout_dirty {
+            if inside_tmux() {
+                refresh_tmux_pane_origin();
+            }
             let next_layout = ui_layout(config.width, config.height);
             if last_layout != Some(next_layout) {
                 clear_screen_and_images(&mut out)?;

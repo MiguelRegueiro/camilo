@@ -1,42 +1,56 @@
 <h1 align="left"><img src="assets/logo.png" width="64" alt="camilo logo" align="absmiddle" />&nbsp;camilo</h1>
 
-<p>
-  A camera app for the terminal.
-</p>
+Terminal camera app for Kitty.
 
-Camilo uses direct V4L2 preview on Linux and FreeBSD, `ffmpeg` as fallback/encoder, and the Kitty graphics protocol for the live preview, shutter controls, photo capture, and video recording.
+Take photos, record videos, and control the camera from a terminal UI.
 
-## Terminal Compatibility
+## Features
 
-| Terminal | Status | Notes |
-| --- | --- | --- |
-| Kitty | Supported | Recommended and tested target. |
+- **Photo and video capture** — switch modes from the sidebar and use the shutter control
+- **Live preview** — low-latency camera feed with optional horizontal mirroring
+- **Audio recording** — use the default microphone or choose an input explicitly
+- **Camera settings** — choose device, resolution, FPS, output folder, and preview backend
+- **Self-timer and thumbnails** — countdown capture plus latest-capture preview
 
-## Run
+## Requirements
+
+- Kitty
+- V4L2 camera device
+- FFmpeg for fallback preview and recording
+
+On FreeBSD, expose webcams with `webcamd`, usually as `/dev/video0`.
+
+## Run from source
+
+Install Rust 1.96+ and the native camera/media dependencies, then run:
 
 ```sh
 cargo run --release
 ```
 
-Useful options:
+## CLI
 
-```sh
-cargo run --release -- --device /dev/video0 --width 1920 --height 1080 --fps 30 --preview-backend auto
-cargo run --release -- --camera-info
+```text
+camilo [options]
 ```
 
-Preview backends:
+Flags:
 
-| Backend | Behavior |
-| --- | --- |
-| `auto` | Try direct V4L2 first, fall back to `ffmpeg`. |
-| `v4l2` | Force direct V4L2 preview. |
-| `ffmpeg` | Force the fallback preview path. |
+- `--device <path>` — select the V4L2 camera device
+- `--width <px>` / `--height <px>` / `--fps <n>` — set capture size and frame rate
+- `--preview-backend <auto|v4l2|ffmpeg>` — choose direct V4L2 preview or ffmpeg fallback
+- `--camera-dir <path>` — choose where photos and videos are saved
+- `--mirror-horizontal` / `--no-mirror-horizontal` — control preview mirroring
+- `--audio-input <name>` — choose the microphone/input used for video recording
+- `--no-audio` — record video without audio
+- `--camera-info` — print selected camera mode information and exit
+- `--force` — run on compatible terminals that do not advertise themselves as Kitty
 
 ## Config
 
+camilo reads configuration from `~/.config/camilo/config.toml`:
+
 ```toml
-# ~/.config/camilo/config.toml
 camera_dir = "~/Pictures/Camera"
 # device = "/dev/video0"
 # width = 1920
@@ -48,22 +62,12 @@ camera_dir = "~/Pictures/Camera"
 # audio_input = "default"
 ```
 
-Preview is mirrored horizontally by default. To disable mirroring only for one run:
+<details>
+<summary><strong>Controls</strong></summary>
 
-```sh
-cargo run --release -- --no-mirror-horizontal
-```
+- Click the shutter button to take a photo or start/stop video recording
+- Click the mode switch to toggle photo/video mode
+- Click the timer control to cycle the self-timer
+- Press `q` to quit
 
-Audio is recorded from the system default microphone. Set `audio_input` to override it, or disable audio for one run:
-
-```sh
-cargo run --release -- --no-audio
-```
-
-## Controls
-
-- Use the right-side shutter button to take pictures or start/stop video recording.
-- Use the right-side mode switch to toggle photo/video mode.
-- Press `q` to quit.
-
-Linux and FreeBSD both use V4L2 devices. On FreeBSD, V4L2 expects a webcam exposed by `webcamd`, usually as `/dev/video0`.
+</details>

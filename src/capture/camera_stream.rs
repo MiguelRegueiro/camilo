@@ -3,6 +3,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -15,6 +16,10 @@ use super::{
     ffmpeg::{camera_stream_ffmpeg_args, read_stderr_async},
     rgb_frame::{V4l2PixelFormat, frame_len},
 };
+
+const MIN_V4L2_STALL_TIMEOUT: Duration = Duration::from_secs(3);
+const V4L2_MISSED_FRAME_LIMIT: u32 = 5;
+const V4L2_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CameraFrameStatus {
@@ -299,6 +304,93 @@ pub(super) struct V4l2StreamInfo {
     pub(super) input_format: &'static str,
 }
 
+pub(super) struct V4l2CaptureStartup<'a> {
+    ready: &'a std::sync::mpsc::Sender<std::result::Result<V4l2StreamInfo, String>>,
+    initial_info: Option<V4l2StreamInfo>,
+}
+
+impl<'a> V4l2CaptureStartup<'a> {
+    fn new(
+        ready: &'a std::sync::mpsc::Sender<std::result::Result<V4l2StreamInfo, String>>,
+    ) -> Self {
+        Self {
+            ready,
+            initial_info: None,
+        }
+    }
+
+    pub(super) fn validate_info(&self, info: V4l2StreamInfo) -> std::result::Result<(), String> {
+        if let Some(initial_info) = self.initial_info
+            && (info.width != initial_info.width || info.height != initial_info.height)
+        {
+            return Err(format!(
+                "recovered v4l2 stream changed dimensions from {}x{} to {}x{}",
+                initial_info.width, initial_info.height, info.width, info.height
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn report_ready(&mut self, info: V4l2StreamInfo) -> std::result::Result<(), String> {
+        self.validate_info(info)?;
+        if self.initial_info.is_some() {
+            return Ok(());
+        }
+        self.ready
+            .send(Ok(info))
+            .map_err(|_| "camera startup receiver closed".to_string())?;
+        self.initial_info = Some(info);
+        Ok(())
+    }
+
+    fn started(&self) -> bool {
+        self.initial_info.is_some()
+    }
+}
+
+pub(super) struct V4l2FrameWatchdog {
+    last_frame_at: Instant,
+    timeout: Duration,
+}
+
+impl V4l2FrameWatchdog {
+    pub(super) fn new(fps: u32) -> Self {
+        Self::new_at(fps, Instant::now())
+    }
+
+    fn new_at(fps: u32, now: Instant) -> Self {
+        let frame_interval = Duration::from_nanos(1_000_000_000 / u64::from(fps.max(1)));
+        Self {
+            last_frame_at: now,
+            timeout: MIN_V4L2_STALL_TIMEOUT
+                .max(frame_interval.saturating_mul(V4L2_MISSED_FRAME_LIMIT)),
+        }
+    }
+
+    pub(super) fn frame_received(&mut self) {
+        self.frame_received_at(Instant::now());
+    }
+
+    fn frame_received_at(&mut self, now: Instant) {
+        self.last_frame_at = now;
+    }
+
+    pub(super) fn stalled(&self) -> bool {
+        self.stalled_at(Instant::now())
+    }
+
+    fn stalled_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_frame_at) >= self.timeout
+    }
+
+    pub(super) fn error(&self, error: &io::Error) -> String {
+        format!(
+            "v4l2 stream produced no frames for {:.1}s: {error}",
+            self.timeout.as_secs_f64()
+        )
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct V4l2FrameConfig {
     pub(super) pixel_format: V4l2PixelFormat,
@@ -339,37 +431,67 @@ fn run_v4l2_capture(
     stderr: &Arc<Mutex<String>>,
     ready: std::sync::mpsc::Sender<std::result::Result<V4l2StreamInfo, String>>,
 ) {
-    if let Err(error) = run_v4l2_capture_inner(config, latest_frame, &ready) {
-        let _ = ready.send(Err(error.clone()));
-        set_camera_stream_text(stderr, &error);
-        mark_camera_stream_error(latest_frame, io::Error::other(error));
+    let mut startup = V4l2CaptureStartup::new(&ready);
+    loop {
+        if startup.started() && camera_stream_should_stop(latest_frame) {
+            return;
+        }
+        match run_v4l2_capture_inner(config, latest_frame, &mut startup) {
+            Ok(()) => return,
+            Err(error) if !startup.started() => {
+                let _ = ready.send(Err(error.clone()));
+                set_camera_stream_text(stderr, &error);
+                mark_camera_stream_error(latest_frame, io::Error::other(error));
+                return;
+            }
+            Err(error) => {
+                set_camera_stream_text(
+                    stderr,
+                    &format!("camera stream interrupted: {error}; reconnecting"),
+                );
+                if camera_stream_should_stop(latest_frame) {
+                    return;
+                }
+                thread::sleep(V4L2_RECONNECT_DELAY);
+            }
+        }
     }
 }
 
 fn run_v4l2_capture_inner(
     config: &Config,
     latest_frame: &Arc<Mutex<LatestCameraFrame>>,
-    ready: &std::sync::mpsc::Sender<std::result::Result<V4l2StreamInfo, String>>,
+    startup: &mut V4l2CaptureStartup<'_>,
 ) -> std::result::Result<(), String> {
-    run_v4l2_capture_platform(config, latest_frame, ready)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_v4l2_capture_platform(config, latest_frame, startup)
+    }))
+    .unwrap_or_else(|payload| {
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("unknown panic");
+        Err(format!("v4l2 capture attempt panicked: {message}"))
+    })
 }
 
 #[cfg(not(target_os = "freebsd"))]
 fn run_v4l2_capture_platform(
     config: &Config,
     latest_frame: &Arc<Mutex<LatestCameraFrame>>,
-    ready: &std::sync::mpsc::Sender<std::result::Result<V4l2StreamInfo, String>>,
+    startup: &mut V4l2CaptureStartup<'_>,
 ) -> std::result::Result<(), String> {
-    super::linux_v4l2::run_capture(config, latest_frame, ready)
+    super::linux_v4l2::run_capture(config, latest_frame, startup)
 }
 
 #[cfg(target_os = "freebsd")]
 fn run_v4l2_capture_platform(
     config: &Config,
     latest_frame: &Arc<Mutex<LatestCameraFrame>>,
-    ready: &std::sync::mpsc::Sender<std::result::Result<V4l2StreamInfo, String>>,
+    startup: &mut V4l2CaptureStartup<'_>,
 ) -> std::result::Result<(), String> {
-    freebsd_v4l2::run_capture(config, latest_frame, ready)
+    freebsd_v4l2::run_capture(config, latest_frame, startup)
 }
 
 pub(super) fn camera_stream_should_stop(state: &Arc<Mutex<LatestCameraFrame>>) -> bool {
@@ -416,5 +538,53 @@ mod tests {
         assert_eq!(app_frame, vec![2, 2, 2]);
         let state = state.lock().expect("state should lock");
         assert_eq!(state.frame, Some(vec![1, 1, 1]));
+    }
+
+    #[test]
+    fn v4l2_watchdog_uses_frame_rate_aware_stall_window() {
+        let now = Instant::now();
+        let fast = V4l2FrameWatchdog::new_at(30, now);
+        assert!(!fast.stalled_at(now + Duration::from_millis(2_999)));
+        assert!(fast.stalled_at(now + Duration::from_secs(3)));
+
+        let slow = V4l2FrameWatchdog::new_at(1, now);
+        assert!(!slow.stalled_at(now + Duration::from_millis(4_999)));
+        assert!(slow.stalled_at(now + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn v4l2_watchdog_resets_after_a_recovered_frame() {
+        let now = Instant::now();
+        let mut watchdog = V4l2FrameWatchdog::new_at(30, now);
+        watchdog.frame_received_at(now + Duration::from_secs(2));
+
+        assert!(!watchdog.stalled_at(now + Duration::from_secs(4)));
+        assert!(watchdog.stalled_at(now + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn v4l2_recovery_preserves_initial_frame_dimensions() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let mut startup = V4l2CaptureStartup::new(&ready_tx);
+        let initial = V4l2StreamInfo {
+            width: 1920,
+            height: 1080,
+            input_format: "mjpeg",
+        };
+        startup.report_ready(initial).unwrap();
+
+        let reported = ready_rx.recv().unwrap().unwrap();
+        assert_eq!((reported.width, reported.height), (1920, 1080));
+        startup.report_ready(initial).unwrap();
+        assert!(ready_rx.try_recv().is_err());
+
+        let error = startup
+            .report_ready(V4l2StreamInfo {
+                width: 1280,
+                height: 720,
+                input_format: "mjpeg",
+            })
+            .expect_err("a recovered stream must preserve RGB buffer dimensions");
+        assert!(error.contains("changed dimensions from 1920x1080 to 1280x720"));
     }
 }

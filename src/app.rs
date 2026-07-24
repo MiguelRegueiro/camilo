@@ -92,6 +92,7 @@ pub(crate) fn run() -> Result<()> {
     let mut layout_dirty = true;
     let mut preview_frame = Vec::new();
     let mut preview_scaler = Rgb24Scaler::default();
+    let mut preview_dirty = false;
     let mut preview_width = config.width;
     let mut preview_height = config.height;
     let mut last_layout = None;
@@ -185,7 +186,6 @@ pub(crate) fn run() -> Result<()> {
                 previous_image_id = None;
                 previous_thumbnail_image_id = None;
                 frame_serial = 0;
-                thumbnail_dirty = true;
                 chrome_dirty = true;
                 no_mic_visible = false;
                 countdown_visible = false;
@@ -202,6 +202,8 @@ pub(crate) fn run() -> Result<()> {
             if preview_frame.len() != preview_len {
                 preview_frame.resize(preview_len, 0);
             }
+            preview_dirty |= have_frame;
+            thumbnail_dirty |= last_thumbnail.is_some();
             layout_dirty = false;
         }
 
@@ -324,11 +326,6 @@ pub(crate) fn run() -> Result<()> {
             }
         }
 
-        if !new_frame {
-            out.flush()?;
-            continue;
-        }
-
         if Instant::now() >= next_thumbnail_rescan {
             let current_path = last_thumbnail
                 .as_ref()
@@ -340,37 +337,46 @@ pub(crate) fn run() -> Result<()> {
             next_thumbnail_rescan = Instant::now() + Duration::from_millis(750);
         }
 
-        let image_id = KITTY_IMAGE_IDS[(frame_serial as usize) % KITTY_IMAGE_IDS.len()];
-        let (display_frame, display_width, display_height) =
-            if preview_width == config.width && preview_height == config.height {
-                (frame.as_slice(), config.width, config.height)
-            } else {
-                preview_scaler.resize(
-                    &frame,
-                    config.width,
-                    config.height,
-                    &mut preview_frame,
-                    preview_width,
-                    preview_height,
-                )?;
-                (preview_frame.as_slice(), preview_width, preview_height)
-            };
-        write_kitty_rgb_frame(
-            &mut out,
-            KittyFramePlacement {
-                image_id,
-                placement_id: KITTY_PLACEMENT_ID,
-                z_index: 0,
-                previous_image_id,
-                width: display_width,
-                height: display_height,
-                area: layout.preview_area,
-            },
-            display_frame,
-            &mut kitty_sequence,
-        )?;
-        previous_image_id = Some(image_id);
-        frame_serial = frame_serial.wrapping_add(1);
+        let render_preview = should_render_preview(have_frame, new_frame, preview_dirty);
+        if !render_preview && !thumbnail_dirty {
+            out.flush()?;
+            continue;
+        }
+
+        if render_preview {
+            let image_id = KITTY_IMAGE_IDS[(frame_serial as usize) % KITTY_IMAGE_IDS.len()];
+            let (display_frame, display_width, display_height) =
+                if preview_width == config.width && preview_height == config.height {
+                    (frame.as_slice(), config.width, config.height)
+                } else {
+                    preview_scaler.resize(
+                        &frame,
+                        config.width,
+                        config.height,
+                        &mut preview_frame,
+                        preview_width,
+                        preview_height,
+                    )?;
+                    (preview_frame.as_slice(), preview_width, preview_height)
+                };
+            write_kitty_rgb_frame(
+                &mut out,
+                KittyFramePlacement {
+                    image_id,
+                    placement_id: KITTY_PLACEMENT_ID,
+                    z_index: 0,
+                    previous_image_id,
+                    width: display_width,
+                    height: display_height,
+                    area: layout.preview_area,
+                },
+                display_frame,
+                &mut kitty_sequence,
+            )?;
+            previous_image_id = Some(image_id);
+            frame_serial = frame_serial.wrapping_add(1);
+            preview_dirty = false;
+        }
 
         if let Some(area) = layout.no_mic_area {
             let no_audio = match &recording {
@@ -510,4 +516,24 @@ fn write_due_recording_frames(
 
 fn recording_frame_interval(fps: u32) -> Duration {
     Duration::from_nanos(1_000_000_000 / u64::from(fps.max(1)))
+}
+
+fn should_render_preview(have_frame: bool, new_frame: bool, preview_dirty: bool) -> bool {
+    have_frame && (new_frame || preview_dirty)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_preview_redraws_without_a_new_camera_frame() {
+        assert!(should_render_preview(true, false, true));
+    }
+
+    #[test]
+    fn preview_waits_for_the_first_camera_frame() {
+        assert!(!should_render_preview(false, false, true));
+        assert!(!should_render_preview(false, true, false));
+    }
 }

@@ -10,8 +10,8 @@ use crate::config::Config;
 
 use super::{
     camera_stream::{
-        LatestCameraFrame, V4l2FrameConfig, V4l2StreamInfo, camera_stream_should_stop,
-        preferred_v4l2_formats, store_latest_frame,
+        LatestCameraFrame, V4l2CaptureStartup, V4l2FrameConfig, V4l2FrameWatchdog, V4l2StreamInfo,
+        camera_stream_should_stop, preferred_v4l2_formats, store_latest_frame,
     },
     rgb_frame::{
         V4l2PixelFormat, decode_camera_frame, frame_len, mirror_rgb24_in_place, v4l2_fourcc,
@@ -22,7 +22,7 @@ use super::{
 pub(super) fn run_capture(
     config: &Config,
     latest_frame: &Arc<Mutex<LatestCameraFrame>>,
-    ready: &std::sync::mpsc::Sender<std::result::Result<V4l2StreamInfo, String>>,
+    startup: &mut V4l2CaptureStartup<'_>,
 ) -> std::result::Result<(), String> {
     use v4l::buffer::Type;
     use v4l::io::mmap::Stream as MmapStream;
@@ -81,6 +81,14 @@ pub(super) fn run_capture(
                 mirror_horizontal: config.mirror_horizontal,
                 frame_len,
             };
+            if let Err(error) = startup.validate_info(V4l2StreamInfo {
+                width: frame_config.width,
+                height: frame_config.height,
+                input_format: frame_config.pixel_format.input_format(),
+            }) {
+                setup_errors.push(error);
+                return None;
+            }
             let mut stream = match MmapStream::with_buffers(&device, Type::VideoCapture, 2) {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -117,20 +125,31 @@ pub(super) fn run_capture(
             }
         ));
     };
-    let _ = ready.send(Ok(V4l2StreamInfo {
+    startup.report_ready(V4l2StreamInfo {
         width: frame_config.width,
         height: frame_config.height,
         input_format: frame_config.pixel_format.input_format(),
-    }));
+    })?;
+    let mut watchdog = V4l2FrameWatchdog::new(config.fps);
 
     loop {
         if camera_stream_should_stop(latest_frame) {
             break;
         }
         match store_v4l2_next_frame(&mut stream, frame_config, latest_frame, &mut buffer) {
-            Ok(reused) => buffer = reused,
-            Err(error) if error.kind() == ErrorKind::TimedOut => {}
+            Ok(reused) => {
+                buffer = reused;
+                watchdog.frame_received();
+            }
+            Err(error) if error.kind() == ErrorKind::TimedOut => {
+                if watchdog.stalled() {
+                    return Err(watchdog.error(&error));
+                }
+            }
             Err(error) if is_transient_v4l2_runtime_read_error(&error) => {
+                if watchdog.stalled() {
+                    return Err(watchdog.error(&error));
+                }
                 thread::sleep(std::time::Duration::from_millis(1));
             }
             Err(error) => return Err(format!("failed to read v4l2 frame: {error}")),

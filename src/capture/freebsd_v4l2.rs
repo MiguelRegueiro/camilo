@@ -17,8 +17,9 @@ use crate::config::Config;
 use super::{
     camera_modes::{CameraMode, camera_mode_preference, fps_from_interval},
     camera_stream::{
-        LatestCameraFrame, V4l2FrameConfig, V4l2StreamInfo, camera_stream_should_stop,
-        mark_camera_stream_ended, preferred_v4l2_formats, store_latest_frame,
+        LatestCameraFrame, V4l2CaptureStartup, V4l2FrameConfig, V4l2FrameWatchdog, V4l2StreamInfo,
+        camera_stream_should_stop, mark_camera_stream_ended, preferred_v4l2_formats,
+        store_latest_frame,
     },
     rgb_frame::{V4l2PixelFormat, decode_camera_frame, frame_len, mirror_rgb24_in_place},
 };
@@ -416,7 +417,7 @@ pub(super) fn best_camera_mode(path: &str) -> Result<CameraMode> {
 pub(super) fn run_capture(
     config: &Config,
     latest_frame: &Arc<Mutex<LatestCameraFrame>>,
-    ready: &std::sync::mpsc::Sender<std::result::Result<V4l2StreamInfo, String>>,
+    startup: &mut V4l2CaptureStartup<'_>,
 ) -> std::result::Result<(), String> {
     let device = Device::open(&config.device)
         .map_err(|error| format!("failed to open v4l2 device {}: {error}", config.device))?;
@@ -463,6 +464,14 @@ pub(super) fn run_capture(
                 mirror_horizontal: config.mirror_horizontal,
                 frame_len,
             };
+            if let Err(error) = startup.validate_info(V4l2StreamInfo {
+                width: frame_config.width,
+                height: frame_config.height,
+                input_format: frame_config.pixel_format.input_format(),
+            }) {
+                setup_errors.push(error);
+                return None;
+            }
             let mut stream = match MmapStream::new(&device, 2) {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -502,11 +511,12 @@ pub(super) fn run_capture(
         ));
     };
 
-    let _ = ready.send(Ok(V4l2StreamInfo {
+    startup.report_ready(V4l2StreamInfo {
         width: frame_config.width,
         height: frame_config.height,
         input_format: frame_config.pixel_format.input_format(),
-    }));
+    })?;
+    let mut watchdog = V4l2FrameWatchdog::new(config.fps);
 
     loop {
         if camera_stream_should_stop(latest_frame) {
@@ -519,8 +529,15 @@ pub(super) fn run_capture(
             &mut buffer,
             Duration::from_millis(100),
         ) {
-            Ok(reused) => buffer = reused,
-            Err(error) if error.kind() == ErrorKind::TimedOut => {}
+            Ok(reused) => {
+                buffer = reused;
+                watchdog.frame_received();
+            }
+            Err(error) if error.kind() == ErrorKind::TimedOut => {
+                if watchdog.stalled() {
+                    return Err(watchdog.error(&error));
+                }
+            }
             Err(error) => return Err(format!("failed to read v4l2 frame: {error}")),
         }
     }

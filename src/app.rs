@@ -105,7 +105,7 @@ pub(crate) fn run() -> Result<()> {
     let mut previous_thumbnail_image_id = None;
     let mut frame_serial = 0_u32;
     let mut thumbnail_serial = 0_u32;
-    let mut last_thumbnail = latest_capture_thumbnail(&config.camera_dir, THUMBNAIL_SIZE);
+    let mut last_thumbnail = latest_capture_thumbnail(&config.picture_dir, THUMBNAIL_SIZE);
     let mut thumbnail_dirty = last_thumbnail.is_some();
     let mut next_thumbnail_rescan = Instant::now() + Duration::from_millis(750);
     let mut capture_requested = false;
@@ -330,8 +330,8 @@ pub(crate) fn run() -> Result<()> {
             let current_path = last_thumbnail
                 .as_ref()
                 .map(|thumbnail| thumbnail.path.as_path());
-            if latest_image_path(&config.camera_dir).as_deref() != current_path {
-                last_thumbnail = latest_capture_thumbnail(&config.camera_dir, THUMBNAIL_SIZE);
+            if latest_image_path(&config.picture_dir).as_deref() != current_path {
+                last_thumbnail = latest_capture_thumbnail(&config.picture_dir, THUMBNAIL_SIZE);
                 thumbnail_dirty = true;
             }
             next_thumbnail_rescan = Instant::now() + Duration::from_millis(750);

@@ -5,7 +5,6 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -13,6 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::config::Config;
 
 use super::ffmpeg::read_stderr_async;
+use super::media_path::video_path;
 
 fn recording_ffmpeg_args(
     config: &Config,
@@ -177,13 +177,13 @@ impl VideoRecording {
     }
 
     fn start_with_audio(config: &Config, audio: RecordingAudio) -> Result<Self> {
-        fs::create_dir_all(&config.camera_dir).with_context(|| {
+        fs::create_dir_all(&config.video_dir).with_context(|| {
             format!(
-                "failed to create camera directory {}",
-                config.camera_dir.display()
+                "failed to create video directory {}",
+                config.video_dir.display()
             )
         })?;
-        let path = video_path(&config.camera_dir)?;
+        let path = video_path(&config.video_dir)?;
         let size = format!("{}x{}", config.width, config.height);
         let framerate = config.fps.to_string();
 
@@ -327,31 +327,9 @@ impl Drop for VideoRecording {
     }
 }
 
-fn video_path(camera_dir: &Path) -> Result<PathBuf> {
-    timestamped_media_path(camera_dir, "video", "mp4")
-}
-
-fn timestamped_media_path(camera_dir: &Path, prefix: &str, extension: &str) -> Result<PathBuf> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?;
-    let stem = format!("{prefix}-{}-{:09}", now.as_secs(), now.subsec_nanos());
-    Ok(camera_dir.join(format!("{stem}.{extension}")))
-}
-
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
-
     use super::*;
-
-    #[test]
-    fn video_path_uses_mp4_extension() {
-        let path =
-            video_path(Path::new("/tmp/camilo-camera")).expect("video path should be generated");
-
-        assert_eq!(path.extension().and_then(OsStr::to_str), Some("mp4"));
-    }
 
     #[test]
     fn recording_args_enable_default_pulse_audio() {

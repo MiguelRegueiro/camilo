@@ -6,6 +6,7 @@ mod freebsd_v4l2;
 mod latest_capture_thumbnail;
 #[cfg(not(target_os = "freebsd"))]
 mod linux_v4l2;
+mod media_path;
 mod photo_capture;
 mod rgb_frame;
 mod video_recording;

@@ -39,7 +39,8 @@ Flags:
 - `--device <path>` — select the V4L2 camera device
 - `--width <px>` / `--height <px>` / `--fps <n>` — set capture size and frame rate
 - `--preview-backend <auto|v4l2|ffmpeg>` — choose direct V4L2 preview or ffmpeg fallback
-- `--camera-dir <path>` — choose where photos and videos are saved
+- `--picture-dir <path>` — choose where photos are saved
+- `--video-dir <path>` — choose where videos are saved
 - `--mirror-horizontal` / `--no-mirror-horizontal` — control preview mirroring
 - `--audio-input <name>` — choose the microphone/input used for video recording
 - `--no-audio` — record video without audio
@@ -51,7 +52,8 @@ Flags:
 camilo reads configuration from `~/.config/camilo/config.toml`:
 
 ```toml
-camera_dir = "~/Pictures/Camera"
+picture_dir = "~/Pictures/Camera"
+video_dir = "~/Videos/Camera"
 # device = "/dev/video0"
 # width = 1920
 # height = 1080
@@ -61,6 +63,11 @@ camera_dir = "~/Pictures/Camera"
 # audio = true
 # audio_input = "default"
 ```
+
+By default, photos go to `Pictures/Camera` and videos go to `Videos/Camera`
+using the user's XDG media directories when available. Filenames look like
+`Photo from YYYY-MM-DD HH-MM-SS.microseconds.jpg` and
+`Recording from YYYY-MM-DD HH-MM-SS.microseconds.mp4`.
 
 <details>
 <summary><strong>Controls</strong></summary>

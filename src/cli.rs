@@ -37,11 +37,17 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Config> {
                 config.fps = parse_positive_arg(&arg, args.next())?;
                 config.fps_set = true;
             }
-            "--camera-dir" => {
+            "--picture-dir" => {
                 let value = args
                     .next()
                     .ok_or_else(|| anyhow!("{arg} requires a directory path"))?;
-                config.camera_dir = expand_home_path(&value);
+                config.picture_dir = expand_home_path(&value);
+            }
+            "--video-dir" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("{arg} requires a directory path"))?;
+                config.video_dir = expand_home_path(&value);
             }
             "--preview-backend" => {
                 let value = args
@@ -87,7 +93,7 @@ fn print_help() {
 camilo - camera app for the terminal
 
 Usage:
-  camilo [--device /dev/video0] [--width 1920] [--height 1080] [--fps 30] [--preview-backend auto|v4l2|ffmpeg] [--camera-dir ~/Pictures/Camera] [--mirror-horizontal] [--no-mirror-horizontal] [--audio-input default] [--no-audio] [--force] [--camera-info]
+  camilo [--device /dev/video0] [--width 1920] [--height 1080] [--fps 30] [--preview-backend auto|v4l2|ffmpeg] [--picture-dir ~/Pictures/Camera] [--video-dir ~/Videos/Camera] [--mirror-horizontal] [--no-mirror-horizontal] [--audio-input default] [--no-audio] [--force] [--camera-info]
 
 Controls:
   Right-side shutter button  take pictures or start/stop video recording
@@ -136,6 +142,23 @@ mod tests {
                 .expect("preview backend should parse");
 
         assert_eq!(config.preview_backend, PreviewBackend::Ffmpeg);
+    }
+
+    #[test]
+    fn media_dir_flags_select_separate_output_dirs() {
+        let config = parse_args(
+            [
+                "--picture-dir".to_string(),
+                "~/Pictures/Webcam".to_string(),
+                "--video-dir".to_string(),
+                "~/Videos/Webcam".to_string(),
+            ]
+            .into_iter(),
+        )
+        .expect("media output dirs should parse");
+
+        assert_eq!(config.picture_dir, expand_home_path("~/Pictures/Webcam"));
+        assert_eq!(config.video_dir, expand_home_path("~/Videos/Webcam"));
     }
 
     #[test]

@@ -1,23 +1,24 @@
 use std::{
     fs,
     io::Write,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::Config;
 
+use super::media_path::photo_path;
+
 pub(crate) fn save_capture(config: &Config, frame: &[u8]) -> Result<PathBuf> {
-    fs::create_dir_all(&config.camera_dir).with_context(|| {
+    fs::create_dir_all(&config.picture_dir).with_context(|| {
         format!(
-            "failed to create camera directory {}",
-            config.camera_dir.display()
+            "failed to create picture directory {}",
+            config.picture_dir.display()
         )
     })?;
-    let path = capture_path(&config.camera_dir)?;
+    let path = photo_path(&config.picture_dir)?;
     let size = format!("{}x{}", config.width, config.height);
 
     let mut child = Command::new("ffmpeg")
@@ -65,16 +66,4 @@ pub(crate) fn save_capture(config: &Config, frame: &[u8]) -> Result<PathBuf> {
     }
 
     Ok(path)
-}
-
-fn capture_path(camera_dir: &Path) -> Result<PathBuf> {
-    timestamped_media_path(camera_dir, "capture", "jpg")
-}
-
-fn timestamped_media_path(camera_dir: &Path, prefix: &str, extension: &str) -> Result<PathBuf> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?;
-    let stem = format!("{prefix}-{}-{:09}", now.as_secs(), now.subsec_nanos());
-    Ok(camera_dir.join(format!("{stem}.{extension}")))
 }

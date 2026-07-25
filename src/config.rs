@@ -40,7 +40,8 @@ pub(crate) struct Config {
     pub(crate) force: bool,
     pub(crate) camera_info: bool,
     pub(crate) mirror_horizontal: bool,
-    pub(crate) camera_dir: PathBuf,
+    pub(crate) picture_dir: PathBuf,
+    pub(crate) video_dir: PathBuf,
     pub(crate) audio: bool,
     pub(crate) audio_input: String,
 }
@@ -60,7 +61,8 @@ impl Default for Config {
             force: false,
             camera_info: false,
             mirror_horizontal: true,
-            camera_dir: default_camera_dir(),
+            picture_dir: default_picture_dir(),
+            video_dir: default_video_dir(),
             audio: true,
             audio_input: DEFAULT_AUDIO_INPUT.to_string(),
         }
@@ -129,7 +131,8 @@ fn apply_config_text(config: &mut Config, text: &str) -> Result<()> {
             "mirror_horizontal" => {
                 config.mirror_horizontal = parse_config_bool(value, line_number, key)?;
             }
-            "camera_dir" => config.camera_dir = parse_config_path(value, line_number, key)?,
+            "picture_dir" => config.picture_dir = parse_config_path(value, line_number, key)?,
+            "video_dir" => config.video_dir = parse_config_path(value, line_number, key)?,
             "audio" => config.audio = parse_config_bool(value, line_number, key)?,
             "audio_input" => config.audio_input = parse_config_string(value, line_number, key)?,
             "" => bail!("line {line_number}: empty config key"),
@@ -192,11 +195,74 @@ fn config_path() -> Option<PathBuf> {
         .map(|dir| dir.join("camilo").join("config.toml"))
 }
 
-fn default_camera_dir() -> PathBuf {
-    env::var_os("HOME")
+fn default_picture_dir() -> PathBuf {
+    default_xdg_media_dir("PICTURES", "Pictures")
+}
+
+fn default_video_dir() -> PathBuf {
+    default_xdg_media_dir("VIDEOS", "Videos")
+}
+
+fn default_xdg_media_dir(kind: &str, fallback_name: &str) -> PathBuf {
+    xdg_user_dir(kind)
+        .or_else(|| {
+            env::var_os("HOME")
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|home| PathBuf::from(home).join(fallback_name))
+        })
+        .map(|dir| dir.join("Camera"))
+        .unwrap_or_else(|| PathBuf::from(fallback_name).join("Camera"))
+}
+
+fn xdg_user_dir(kind: &str) -> Option<PathBuf> {
+    let key = format!("XDG_{kind}_DIR");
+    env::var_os(&key)
         .filter(|path| !path.as_os_str().is_empty())
-        .map(|home| PathBuf::from(home).join("Pictures").join("Camera"))
-        .unwrap_or_else(|| PathBuf::from("Camera"))
+        .map(PathBuf::from)
+        .or_else(|| xdg_user_dir_from_config(&key))
+}
+
+fn xdg_user_dir_from_config(key: &str) -> Option<PathBuf> {
+    let path = env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME")
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|home| PathBuf::from(home).join(".config"))
+        })?
+        .join("user-dirs.dirs");
+    let text = fs::read_to_string(path).ok()?;
+    text.lines()
+        .filter_map(|line| parse_user_dir_line(line, key))
+        .next()
+}
+
+fn parse_user_dir_line(line: &str, key: &str) -> Option<PathBuf> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (line_key, value) = line.split_once('=')?;
+    if line_key.trim() != key {
+        return None;
+    }
+    let path = parse_config_string(value.trim(), 0, key).ok()?;
+    Some(expand_xdg_user_dir_path(&path))
+}
+
+fn expand_xdg_user_dir_path(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("$HOME/") {
+        if let Some(home) = env::var_os("HOME").filter(|home| !home.as_os_str().is_empty()) {
+            return PathBuf::from(home).join(rest);
+        }
+    } else if path == "$HOME"
+        && let Some(home) = env::var_os("HOME").filter(|home| !home.as_os_str().is_empty())
+    {
+        return PathBuf::from(home);
+    }
+
+    expand_home_path(path)
 }
 
 pub(crate) fn expand_home_path(path: &str) -> PathBuf {
@@ -242,7 +308,8 @@ mod tests {
                 height = 450
                 fps = 60
                 preview_backend = "v4l2"
-                camera_dir = "/tmp/camera"
+                picture_dir = "/tmp/pictures"
+                video_dir = "/tmp/videos"
                 audio = false
                 audio_input = "pulse:alsa_input.usb-Test_Mic"
             "#,
@@ -257,9 +324,34 @@ mod tests {
         assert_eq!(config.fps, 60);
         assert!(config.fps_set);
         assert_eq!(config.preview_backend, PreviewBackend::V4l2);
-        assert_eq!(config.camera_dir, PathBuf::from("/tmp/camera"));
+        assert_eq!(config.picture_dir, PathBuf::from("/tmp/pictures"));
+        assert_eq!(config.video_dir, PathBuf::from("/tmp/videos"));
         assert!(!config.audio);
         assert_eq!(config.audio_input, "pulse:alsa_input.usb-Test_Mic");
+    }
+
+    #[test]
+    fn config_file_rejects_removed_camera_dir() {
+        let mut config = Config::default();
+
+        let error = apply_config_text(&mut config, "camera_dir = \"/tmp/camera\"\n")
+            .expect_err("removed camera_dir key should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown config key `camera_dir`")
+        );
+    }
+
+    #[test]
+    fn xdg_user_dir_lines_expand_home() {
+        let parsed = parse_user_dir_line("XDG_VIDEOS_DIR=\"$HOME/Clips\"", "XDG_VIDEOS_DIR")
+            .expect("line should parse");
+
+        if let Some(home) = env::var_os("HOME").filter(|home| !home.as_os_str().is_empty()) {
+            assert_eq!(parsed, PathBuf::from(home).join("Clips"));
+        }
     }
 
     #[test]

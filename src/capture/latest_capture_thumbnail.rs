@@ -17,14 +17,14 @@ pub(crate) struct CaptureThumbnail {
     pub(crate) frame: Vec<u8>,
 }
 
-pub(crate) fn latest_capture_thumbnail(camera_dir: &Path, size: u32) -> Option<CaptureThumbnail> {
-    let path = latest_image_path(camera_dir)?;
+pub(crate) fn latest_capture_thumbnail(picture_dir: &Path, size: u32) -> Option<CaptureThumbnail> {
+    let path = latest_image_path(picture_dir)?;
     let frame = load_image_thumbnail(&path, size).ok()?;
     Some(CaptureThumbnail { path, frame })
 }
 
-pub(crate) fn latest_image_path(camera_dir: &Path) -> Option<PathBuf> {
-    fs::read_dir(camera_dir)
+pub(crate) fn latest_image_path(picture_dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(picture_dir)
         .ok()?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())

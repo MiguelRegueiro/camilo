@@ -92,7 +92,7 @@ pub(crate) fn ui_layout(source_width: u32, source_height: u32) -> UiLayout {
 
     let (mode_toggle, mode_pill_area) = mode_pill_area(sidebar);
     let (self_timer_toggle, self_timer_area) = self_timer_area(sidebar);
-    let countdown_area = countdown_area(preview_bounds);
+    let countdown_area = countdown_area(preview_bounds, cell_width, cell_height);
     let recording_timer_area = recording_timer_area(preview_bounds);
     let no_mic_area = no_mic_area(preview_bounds);
     let shutter_slot = shutter_slot(sidebar, rows, self_timer_area);
@@ -291,13 +291,24 @@ fn shutter_slot(
     })
 }
 
-fn countdown_area(preview: Rect) -> Option<ImageArea> {
+fn countdown_area(preview: Rect, cell_width: f64, cell_height: f64) -> Option<ImageArea> {
+    const COUNTDOWN_ASPECT_RATIO: f64 = 4.0 / 3.0;
+
     if preview.cols < 8 || preview.rows < 6 {
         return None;
     }
 
-    let cols = 8.min(preview.cols.saturating_sub(2));
-    let rows = 5.min(preview.rows.saturating_sub(2));
+    let max_cols = 8.min(preview.cols.saturating_sub(2));
+    let max_rows = 5.min(preview.rows.saturating_sub(2));
+    let max_width_px = f64::from(max_cols) * cell_width;
+    let max_height_px = f64::from(max_rows) * cell_height;
+    let (width_px, height_px) = if max_width_px / max_height_px > COUNTDOWN_ASPECT_RATIO {
+        (max_height_px * COUNTDOWN_ASPECT_RATIO, max_height_px)
+    } else {
+        (max_width_px, max_width_px / COUNTDOWN_ASPECT_RATIO)
+    };
+    let cols = ((width_px / cell_width).round() as u16).clamp(1, max_cols);
+    let rows = ((height_px / cell_height).round() as u16).clamp(1, max_rows);
     Some(ImageArea {
         x: preview.x + preview.cols.saturating_sub(cols) / 2,
         y: preview.y + preview.rows.saturating_sub(rows) / 2,
@@ -458,6 +469,25 @@ mod tests {
                 cols: 4,
                 rows: 3,
             }
+        );
+    }
+
+    #[test]
+    fn countdown_area_preserves_raster_aspect_ratio_for_tall_terminal_cells() {
+        let preview = Rect {
+            x: 0,
+            y: 0,
+            cols: 80,
+            rows: 24,
+        };
+
+        let area = countdown_area(preview, 8.0, 16.0).unwrap();
+
+        assert_eq!(area.cols, 8);
+        assert_eq!(area.rows, 3);
+        assert_eq!(
+            f64::from(area.cols) * 8.0 / (f64::from(area.rows) * 16.0),
+            4.0 / 3.0
         );
     }
 

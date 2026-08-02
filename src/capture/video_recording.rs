@@ -3,7 +3,10 @@ use std::{
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
 };
 
@@ -26,6 +29,8 @@ fn recording_ffmpeg_args(
         "-loglevel".to_string(),
         "error".to_string(),
         "-nostdin".to_string(),
+        "-use_wallclock_as_timestamps".to_string(),
+        "1".to_string(),
         "-f".to_string(),
         "rawvideo".to_string(),
         "-pixel_format".to_string(),
@@ -66,10 +71,14 @@ fn recording_ffmpeg_args(
         "libx264".to_string(),
         "-preset".to_string(),
         "veryfast".to_string(),
+        "-x264-params".to_string(),
+        "sliced-threads=1".to_string(),
         "-crf".to_string(),
         "18".to_string(),
         "-pix_fmt".to_string(),
         "yuv420p".to_string(),
+        "-fps_mode".to_string(),
+        "vfr".to_string(),
     ]);
 
     if audio.encodes_track() {
@@ -145,7 +154,191 @@ pub(crate) fn audio_input_available(config: &Config) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Default)]
+struct RecordingFrameState {
+    pending: Option<Vec<u8>>,
+    spare: Option<Vec<u8>>,
+    stopping: bool,
+    failure: Option<String>,
+}
+
+#[derive(Default)]
+struct RecordingFrameMailbox {
+    state: Mutex<RecordingFrameState>,
+    ready: Condvar,
+}
+
+impl RecordingFrameMailbox {
+    fn submit(&self, frame: &[u8]) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(error) = &state.failure {
+            bail!("video recording worker failed: {error}");
+        }
+        if state.stopping {
+            bail!("video recording input is closed");
+        }
+
+        let mut buffer = state
+            .pending
+            .take()
+            .or_else(|| state.spare.take())
+            .unwrap_or_else(|| Vec::with_capacity(frame.len()));
+        buffer.clear();
+        buffer.extend_from_slice(frame);
+        state.pending = Some(buffer);
+        drop(state);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    fn next_frame(&self) -> Option<Vec<u8>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(frame) = state.pending.take() {
+                return Some(frame);
+            }
+            if state.stopping {
+                return None;
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn recycle(&self, frame: Vec<u8>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.spare = Some(frame);
+    }
+
+    fn stop(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.stopping = true;
+        drop(state);
+        self.ready.notify_one();
+    }
+
+    fn fail(&self, error: &anyhow::Error) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.failure = Some(format!("{error:#}"));
+        state.stopping = true;
+        drop(state);
+        self.ready.notify_all();
+    }
+}
+
 pub(crate) struct VideoRecording {
+    mailbox: Arc<RecordingFrameMailbox>,
+    worker: Option<thread::JoinHandle<Result<()>>>,
+    audio: Arc<AtomicBool>,
+}
+
+impl VideoRecording {
+    pub(crate) fn start(config: &Config) -> Result<Self> {
+        Self::start_with_encoder(config, FfmpegVideoRecording::start(config)?)
+    }
+
+    pub(crate) fn start_without_audio(config: &Config) -> Result<Self> {
+        Self::start_with_encoder(config, FfmpegVideoRecording::start_without_audio(config)?)
+    }
+
+    fn start_with_encoder(config: &Config, encoder: FfmpegVideoRecording) -> Result<Self> {
+        let mailbox = Arc::new(RecordingFrameMailbox::default());
+        let audio = Arc::new(AtomicBool::new(encoder.audio()));
+        let worker_mailbox = Arc::clone(&mailbox);
+        let worker_audio = Arc::clone(&audio);
+        let worker_config = config.clone();
+        let worker = thread::Builder::new()
+            .name("camilo-video-encoder".to_string())
+            .spawn(move || {
+                let result =
+                    run_recording_worker(encoder, worker_config, &worker_mailbox, &worker_audio);
+                if let Err(error) = &result {
+                    worker_mailbox.fail(error);
+                }
+                result
+            })
+            .context("failed to start video recording worker")?;
+
+        Ok(Self {
+            mailbox,
+            worker: Some(worker),
+            audio,
+        })
+    }
+
+    pub(crate) fn write_frame(&mut self, frame: &[u8]) -> Result<()> {
+        self.mailbox.submit(frame)
+    }
+
+    pub(crate) fn stop_async(mut self) -> thread::JoinHandle<Result<()>> {
+        self.mailbox.stop();
+        self.worker
+            .take()
+            .expect("video recording worker should be available")
+    }
+
+    pub(crate) fn stop(mut self) -> Result<()> {
+        self.mailbox.stop();
+        join_recording_worker(
+            self.worker
+                .take()
+                .expect("video recording worker should be available"),
+        )
+    }
+
+    pub(crate) fn audio(&self) -> bool {
+        self.audio.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for VideoRecording {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            self.mailbox.stop();
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_recording_worker(
+    mut encoder: FfmpegVideoRecording,
+    config: Config,
+    mailbox: &RecordingFrameMailbox,
+    audio: &AtomicBool,
+) -> Result<()> {
+    while let Some(frame) = mailbox.next_frame() {
+        if encoder.write_frame(&config, &frame)? == RecordingWriteStatus::RestartedWithoutAudio {
+            audio.store(false, Ordering::Release);
+        }
+        mailbox.recycle(frame);
+    }
+    encoder.stop()
+}
+
+fn join_recording_worker(worker: thread::JoinHandle<Result<()>>) -> Result<()> {
+    worker
+        .join()
+        .unwrap_or_else(|_| Err(anyhow!("video recording worker panicked")))
+}
+
+struct FfmpegVideoRecording {
     child: Child,
     stdin: Option<ChildStdin>,
     stderr: Arc<Mutex<String>>,
@@ -155,13 +348,13 @@ pub(crate) struct VideoRecording {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RecordingWriteStatus {
+enum RecordingWriteStatus {
     Written,
     RestartedWithoutAudio,
 }
 
-impl VideoRecording {
-    pub(crate) fn start(config: &Config) -> Result<Self> {
+impl FfmpegVideoRecording {
+    fn start(config: &Config) -> Result<Self> {
         Self::start_with_audio(
             config,
             if config.audio {
@@ -172,7 +365,7 @@ impl VideoRecording {
         )
     }
 
-    pub(crate) fn start_without_audio(config: &Config) -> Result<Self> {
+    fn start_without_audio(config: &Config) -> Result<Self> {
         Self::start_with_audio(config, RecordingAudio::Silent)
     }
 
@@ -232,10 +425,6 @@ impl VideoRecording {
             }
             Err(error) => Err(error).context("failed to send frame to video encoder"),
         }
-    }
-
-    pub(crate) fn stop_async(self) -> thread::JoinHandle<Result<()>> {
-        thread::spawn(move || self.stop())
     }
 
     pub(crate) fn stop(mut self) -> Result<()> {
@@ -314,7 +503,7 @@ fn looks_like_audio_input_failure(stderr: &str) -> bool {
         || stderr.contains("avfoundation")
 }
 
-impl Drop for VideoRecording {
+impl Drop for FfmpegVideoRecording {
     fn drop(&mut self) {
         if self.stdin.is_some() {
             drop(self.stdin.take());
@@ -330,6 +519,26 @@ impl Drop for VideoRecording {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_mailbox_keeps_the_latest_pending_frame() {
+        let mailbox = RecordingFrameMailbox::default();
+
+        mailbox.submit(&[1, 2, 3]).expect("submit first frame");
+        mailbox.submit(&[4, 5, 6]).expect("submit newer frame");
+        mailbox.stop();
+
+        assert_eq!(mailbox.next_frame(), Some(vec![4, 5, 6]));
+        assert_eq!(mailbox.next_frame(), None);
+    }
+
+    #[test]
+    fn recording_mailbox_rejects_frames_after_stop() {
+        let mailbox = RecordingFrameMailbox::default();
+        mailbox.stop();
+
+        assert!(mailbox.submit(&[1, 2, 3]).is_err());
+    }
 
     #[test]
     fn recording_args_enable_default_pulse_audio() {
@@ -352,6 +561,29 @@ mod tests {
         );
         assert!(args.iter().any(|arg| arg == "-shortest"));
         assert!(!args.iter().any(|arg| arg == "-an"));
+    }
+
+    #[test]
+    fn recording_args_preserve_real_frame_timing_with_sliced_encoding() {
+        let config = Config::default();
+        let args = recording_ffmpeg_args(
+            &config,
+            Path::new("/tmp/camilo.mp4"),
+            "3840x2160",
+            "30",
+            RecordingAudio::Disabled,
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-use_wallclock_as_timestamps", "1"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-x264-params", "sliced-threads=1"])
+        );
+        assert!(args.windows(2).any(|window| window == ["-fps_mode", "vfr"]));
+        assert!(args.windows(2).any(|window| window == ["-crf", "18"]));
     }
 
     #[test]

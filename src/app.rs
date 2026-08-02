@@ -9,10 +9,10 @@ use anyhow::{Result, bail};
 
 use crate::{
     capture::{
-        CameraFrameStatus, CameraStream, CaptureThumbnail, RecordingWriteStatus, Rgb24Scaler,
-        THUMBNAIL_SIZE, VideoRecording, apply_best_camera_mode, audio_input_available,
-        capture_image_paths, frame_len, latest_capture_thumbnail, latest_image_path,
-        load_gallery_image, save_capture, square_thumbnail,
+        CameraFrameStatus, CameraStream, CaptureThumbnail, Rgb24Scaler, THUMBNAIL_SIZE,
+        VideoRecording, apply_best_camera_mode, audio_input_available, capture_image_paths,
+        frame_len, latest_capture_thumbnail, latest_image_path, load_gallery_image, save_capture,
+        square_thumbnail,
     },
     cli,
     config::PreviewBackend,
@@ -35,8 +35,6 @@ use crate::{
 struct ActiveRecording {
     encoder: VideoRecording,
     started_at: Instant,
-    next_frame_at: Instant,
-    frame_interval: Duration,
     last_timer_second: Option<u64>,
     timer_image_serial: u32,
     timer_image_id: Option<u32>,
@@ -274,8 +272,8 @@ pub(crate) fn run() -> Result<()> {
             }
         }
 
-        if let Some(recording) = recording.as_mut() {
-            write_due_recording_frames(recording, &config, &frame, Instant::now())?;
+        if new_frame && let Some(recording) = recording.as_mut() {
+            recording.encoder.write_frame(&frame)?;
         }
 
         if layout_dirty {
@@ -381,7 +379,7 @@ pub(crate) fn run() -> Result<()> {
                                 last_visible_second: None,
                             });
                         } else {
-                            recording = Some(start_recording(&config, audio_available)?);
+                            recording = Some(start_recording(&config, audio_available, &frame)?);
                         }
                         chrome_dirty = true;
                     }
@@ -410,7 +408,7 @@ pub(crate) fn run() -> Result<()> {
                         )?;
                     }
                     PendingCaptureAction::StartRecording => {
-                        recording = Some(start_recording(&config, audio_available)?);
+                        recording = Some(start_recording(&config, audio_available, &frame)?);
                         chrome_dirty = true;
                     }
                 }
@@ -695,44 +693,21 @@ fn take_photo(
 fn start_recording(
     config: &crate::config::Config,
     audio_available: bool,
+    frame: &[u8],
 ) -> Result<ActiveRecording> {
-    let encoder = if audio_available {
+    let mut encoder = if audio_available {
         VideoRecording::start(config)?
     } else {
         VideoRecording::start_without_audio(config)?
     };
-    let now = Instant::now();
+    encoder.write_frame(frame)?;
     Ok(ActiveRecording {
         encoder,
-        started_at: now,
-        next_frame_at: now,
-        frame_interval: recording_frame_interval(config.fps),
+        started_at: Instant::now(),
         last_timer_second: None,
         timer_image_serial: 0,
         timer_image_id: None,
     })
-}
-
-fn write_due_recording_frames(
-    recording: &mut ActiveRecording,
-    config: &crate::config::Config,
-    frame: &[u8],
-    now: Instant,
-) -> Result<()> {
-    while recording.next_frame_at <= now {
-        match recording.encoder.write_frame(config, frame)? {
-            RecordingWriteStatus::Written => {}
-            RecordingWriteStatus::RestartedWithoutAudio => {
-                recording.last_timer_second = None;
-            }
-        }
-        recording.next_frame_at += recording.frame_interval;
-    }
-    Ok(())
-}
-
-fn recording_frame_interval(fps: u32) -> Duration {
-    Duration::from_nanos(1_000_000_000 / u64::from(fps.max(1)))
 }
 
 fn should_render_preview(have_frame: bool, new_frame: bool, preview_dirty: bool) -> bool {

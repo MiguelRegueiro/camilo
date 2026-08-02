@@ -3,11 +3,14 @@ use std::{io, io::Write};
 use super::{
     input::{CaptureMode, SelfTimer},
     kitty_graphics::{
-        KITTY_COUNTDOWN_IMAGE_ID, KITTY_COUNTDOWN_PLACEMENT_ID, KITTY_MODE_IMAGE_ID,
-        KITTY_MODE_PLACEMENT_ID, KITTY_NO_MIC_IMAGE_ID, KITTY_NO_MIC_PLACEMENT_ID,
-        KITTY_SELF_TIMER_IMAGE_ID, KITTY_SELF_TIMER_PLACEMENT_ID, KITTY_SHUTTER_IMAGE_ID,
-        KITTY_SHUTTER_PLACEMENT_ID, KITTY_TIMER_IMAGE_ID, KITTY_TIMER_PLACEMENT_ID,
-        KittyFramePlacement, write_kitty_image,
+        KITTY_COUNTDOWN_IMAGE_ID, KITTY_COUNTDOWN_PLACEMENT_ID, KITTY_GALLERY_CLOSE_IMAGE_ID,
+        KITTY_GALLERY_CLOSE_PLACEMENT_ID, KITTY_GALLERY_COUNTER_IMAGE_ID,
+        KITTY_GALLERY_COUNTER_PLACEMENT_ID, KITTY_GALLERY_NEXT_IMAGE_ID,
+        KITTY_GALLERY_NEXT_PLACEMENT_ID, KITTY_GALLERY_PREVIOUS_IMAGE_ID,
+        KITTY_GALLERY_PREVIOUS_PLACEMENT_ID, KITTY_MODE_IMAGE_ID, KITTY_MODE_PLACEMENT_ID,
+        KITTY_NO_MIC_IMAGE_ID, KITTY_NO_MIC_PLACEMENT_ID, KITTY_SELF_TIMER_IMAGE_ID,
+        KITTY_SELF_TIMER_PLACEMENT_ID, KITTY_SHUTTER_IMAGE_ID, KITTY_SHUTTER_PLACEMENT_ID,
+        KITTY_TIMER_IMAGE_ID, KITTY_TIMER_PLACEMENT_ID, KittyFramePlacement, write_kitty_image,
     },
     layout::{ImageArea, UiLayout},
     raster::*,
@@ -24,12 +27,16 @@ const NO_MIC_PILL_WIDTH: u32 = 72;
 const NO_MIC_PILL_HEIGHT: u32 = 48;
 const COUNTDOWN_WIDTH: u32 = 128;
 const COUNTDOWN_HEIGHT: u32 = 96;
+const GALLERY_BUTTON_SIZE: u32 = 72;
+const GALLERY_COUNTER_WIDTH: u32 = 192;
+const GALLERY_COUNTER_HEIGHT: u32 = 64;
 const SHUTTER_Z_INDEX: i32 = 1_000_000_001;
 const MODE_PILL_Z_INDEX: i32 = 1_000_000_002;
 const TIMER_Z_INDEX: i32 = 1_000_000_003;
 const NO_MIC_Z_INDEX: i32 = 1_000_000_004;
 const SELF_TIMER_Z_INDEX: i32 = 1_000_000_005;
 const COUNTDOWN_Z_INDEX: i32 = 1_000_000_006;
+const GALLERY_CONTROL_Z_INDEX: i32 = 1_000_000_010;
 
 pub(crate) fn draw_sidebar(out: &mut impl Write, layout: UiLayout) -> io::Result<()> {
     if layout.sidebar.cols == 0 {
@@ -181,6 +188,212 @@ pub(crate) fn write_kitty_no_mic_pill(
         32,
         sequence,
     )
+}
+
+pub(crate) fn write_kitty_gallery_previous_button(
+    out: &mut impl Write,
+    area: ImageArea,
+    enabled: bool,
+    sequence: &mut Vec<u8>,
+) -> io::Result<()> {
+    let frame = gallery_navigation_rgba(GALLERY_BUTTON_SIZE, enabled, false);
+    write_kitty_image(
+        out,
+        KittyFramePlacement {
+            image_id: KITTY_GALLERY_PREVIOUS_IMAGE_ID,
+            placement_id: KITTY_GALLERY_PREVIOUS_PLACEMENT_ID,
+            z_index: GALLERY_CONTROL_Z_INDEX,
+            previous_image_id: None,
+            width: GALLERY_BUTTON_SIZE,
+            height: GALLERY_BUTTON_SIZE,
+            area,
+        },
+        &frame,
+        32,
+        sequence,
+    )
+}
+
+pub(crate) fn write_kitty_gallery_next_button(
+    out: &mut impl Write,
+    area: ImageArea,
+    enabled: bool,
+    sequence: &mut Vec<u8>,
+) -> io::Result<()> {
+    let frame = gallery_navigation_rgba(GALLERY_BUTTON_SIZE, enabled, true);
+    write_kitty_image(
+        out,
+        KittyFramePlacement {
+            image_id: KITTY_GALLERY_NEXT_IMAGE_ID,
+            placement_id: KITTY_GALLERY_NEXT_PLACEMENT_ID,
+            z_index: GALLERY_CONTROL_Z_INDEX,
+            previous_image_id: None,
+            width: GALLERY_BUTTON_SIZE,
+            height: GALLERY_BUTTON_SIZE,
+            area,
+        },
+        &frame,
+        32,
+        sequence,
+    )
+}
+
+pub(crate) fn write_kitty_gallery_close_button(
+    out: &mut impl Write,
+    area: ImageArea,
+    sequence: &mut Vec<u8>,
+) -> io::Result<()> {
+    let frame = gallery_close_rgba(GALLERY_BUTTON_SIZE);
+    write_kitty_image(
+        out,
+        KittyFramePlacement {
+            image_id: KITTY_GALLERY_CLOSE_IMAGE_ID,
+            placement_id: KITTY_GALLERY_CLOSE_PLACEMENT_ID,
+            z_index: GALLERY_CONTROL_Z_INDEX,
+            previous_image_id: None,
+            width: GALLERY_BUTTON_SIZE,
+            height: GALLERY_BUTTON_SIZE,
+            area,
+        },
+        &frame,
+        32,
+        sequence,
+    )
+}
+
+pub(crate) fn write_kitty_gallery_counter(
+    out: &mut impl Write,
+    area: ImageArea,
+    current: usize,
+    total: usize,
+    sequence: &mut Vec<u8>,
+) -> io::Result<()> {
+    let frame = gallery_counter_rgba(
+        GALLERY_COUNTER_WIDTH,
+        GALLERY_COUNTER_HEIGHT,
+        current,
+        total,
+    );
+    write_kitty_image(
+        out,
+        KittyFramePlacement {
+            image_id: KITTY_GALLERY_COUNTER_IMAGE_ID,
+            placement_id: KITTY_GALLERY_COUNTER_PLACEMENT_ID,
+            z_index: GALLERY_CONTROL_Z_INDEX,
+            previous_image_id: None,
+            width: GALLERY_COUNTER_WIDTH,
+            height: GALLERY_COUNTER_HEIGHT,
+            area,
+        },
+        &frame,
+        32,
+        sequence,
+    )
+}
+
+fn gallery_navigation_rgba(size: u32, enabled: bool, points_right: bool) -> Vec<u8> {
+    let mut frame = gallery_button_background(size, enabled);
+    let center = f64::from(size) / 2.0;
+    let direction = if points_right { 1.0 } else { -1.0 };
+    let color = if enabled {
+        [250, 250, 250]
+    } else {
+        [113, 113, 122]
+    };
+    let tip_x = center + 8.0 * direction;
+    let tail_x = center - 7.0 * direction;
+    for tail_y in [center - 13.0, center + 13.0] {
+        draw_soft_line(
+            &mut frame,
+            size,
+            size,
+            SoftLine {
+                from: (tail_x, tail_y),
+                to: (tip_x, center),
+                radius: 2.8,
+                color,
+                alpha: if enabled { 242 } else { 190 },
+            },
+        );
+    }
+    frame
+}
+
+fn gallery_close_rgba(size: u32) -> Vec<u8> {
+    let mut frame = gallery_button_background(size, true);
+    let center = f64::from(size) / 2.0;
+    for (from, to) in [
+        (
+            (center - 11.0, center - 11.0),
+            (center + 11.0, center + 11.0),
+        ),
+        (
+            (center + 11.0, center - 11.0),
+            (center - 11.0, center + 11.0),
+        ),
+    ] {
+        draw_soft_line(
+            &mut frame,
+            size,
+            size,
+            SoftLine {
+                from,
+                to,
+                radius: 2.6,
+                color: [250, 250, 250],
+                alpha: 238,
+            },
+        );
+    }
+    frame
+}
+
+fn gallery_button_background(size: u32, enabled: bool) -> Vec<u8> {
+    let mut frame = vec![0_u8; (size * size * 4) as usize];
+    fill_rounded_rect(
+        &mut frame,
+        size,
+        size,
+        RoundedRect {
+            x: 5.0,
+            y: 5.0,
+            width: f64::from(size - 10),
+            height: f64::from(size - 10),
+            radius: 17.0,
+        },
+        [24, 24, 27],
+        if enabled { 210 } else { 148 },
+    );
+    frame
+}
+
+fn gallery_counter_rgba(width: u32, height: u32, current: usize, total: usize) -> Vec<u8> {
+    let mut frame = vec![0_u8; (width * height * 4) as usize];
+    fill_rounded_rect(
+        &mut frame,
+        width,
+        height,
+        RoundedRect {
+            x: 4.0,
+            y: 4.0,
+            width: f64::from(width - 8),
+            height: f64::from(height - 8),
+            radius: 20.0,
+        },
+        [24, 24, 27],
+        205,
+    );
+    let text = format!("{current}/{total}");
+    let text_width = timer_text_width(&text);
+    draw_timer_text(
+        &mut frame,
+        width,
+        height,
+        width.saturating_sub(text_width) / 2,
+        18,
+        &text,
+    );
+    frame
 }
 
 fn recording_timer_rgba(width: u32, height: u32, elapsed: std::time::Duration) -> Vec<u8> {
@@ -565,9 +778,35 @@ fn draw_timer_text(frame: &mut [u8], width: u32, height: u32, x: u32, y: u32, te
                 fill_timer_bar(frame, width, height, cursor + 3, y + 20, 4, 4);
                 cursor += 12;
             }
+            b'/' => {
+                draw_soft_line(
+                    frame,
+                    width,
+                    height,
+                    SoftLine {
+                        from: (f64::from(cursor + 12), f64::from(y + 2)),
+                        to: (f64::from(cursor + 2), f64::from(y + 28)),
+                        radius: 1.8,
+                        color: [250, 250, 250],
+                        alpha: 218,
+                    },
+                );
+                cursor += 16;
+            }
             _ => {}
         }
     }
+}
+
+fn timer_text_width(text: &str) -> u32 {
+    text.bytes()
+        .map(|ch| match ch {
+            b'0'..=b'9' => 22,
+            b':' => 12,
+            b'/' => 16,
+            _ => 0,
+        })
+        .sum()
 }
 
 fn draw_timer_digit(frame: &mut [u8], width: u32, height: u32, x: u32, y: u32, digit: u8) {
@@ -915,5 +1154,36 @@ mod tests {
         assert!(text.contains("a=T,q=2,f=32,s=72,v=48"));
         assert!(text.contains(&format!("i={KITTY_NO_MIC_IMAGE_ID}")));
         assert!(text.contains(&format!("p={KITTY_NO_MIC_PLACEMENT_ID}")));
+    }
+
+    #[test]
+    fn gallery_navigation_button_is_a_transparent_overlay() {
+        let frame = gallery_navigation_rgba(GALLERY_BUTTON_SIZE, true, false);
+        let center = (((GALLERY_BUTTON_SIZE / 2) * GALLERY_BUTTON_SIZE + GALLERY_BUTTON_SIZE / 2)
+            * 4) as usize;
+
+        assert_eq!(frame[3], 0);
+        assert!(frame[center + 3] > 0);
+        assert!(
+            frame.chunks_exact(4).any(|pixel| {
+                pixel[0] > 180 && pixel[1] > 180 && pixel[2] > 180 && pixel[3] > 180
+            })
+        );
+    }
+
+    #[test]
+    fn gallery_counter_draws_the_current_and_total_values() {
+        let frame = gallery_counter_rgba(GALLERY_COUNTER_WIDTH, GALLERY_COUNTER_HEIGHT, 3, 12);
+
+        assert_eq!(
+            frame.len(),
+            (GALLERY_COUNTER_WIDTH * GALLERY_COUNTER_HEIGHT * 4) as usize
+        );
+        assert_eq!(frame[3], 0);
+        assert!(
+            frame.chunks_exact(4).any(|pixel| {
+                pixel[0] > 180 && pixel[1] > 180 && pixel[2] > 180 && pixel[3] > 180
+            })
+        );
     }
 }

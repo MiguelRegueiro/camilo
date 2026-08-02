@@ -14,7 +14,8 @@ mod video_recording;
 pub(crate) use camera_modes::apply_best_camera_mode;
 pub(crate) use camera_stream::{CameraFrameStatus, CameraStream};
 pub(crate) use latest_capture_thumbnail::{
-    CaptureThumbnail, THUMBNAIL_SIZE, latest_capture_thumbnail, latest_image_path, square_thumbnail,
+    CaptureThumbnail, THUMBNAIL_SIZE, capture_image_paths, latest_capture_thumbnail,
+    latest_image_path, load_gallery_image, square_thumbnail,
 };
 pub(crate) use photo_capture::save_capture;
 pub(crate) use rgb_frame::{Rgb24Scaler, frame_len};

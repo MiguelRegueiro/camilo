@@ -75,6 +75,9 @@ using the user's XDG media directories when available. Filenames look like
 - Click the shutter button to take a photo or start/stop video recording
 - Click the mode switch to toggle photo/video mode
 - Click the timer control to cycle the self-timer
+- Click the latest photo thumbnail to open the gallery
+- Use the gallery arrows or the left/right arrow keys to browse photos
+- Press `Esc` or click the close button to leave the gallery
 - Press `q` to quit
 
 </details>

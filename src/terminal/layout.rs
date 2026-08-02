@@ -51,6 +51,19 @@ pub(crate) struct UiLayout {
     pub(crate) recording_timer_area: Option<ImageArea>,
     pub(crate) no_mic_area: Option<ImageArea>,
     pub(crate) thumbnail_area: Option<ImageArea>,
+    pub(crate) thumbnail_button: Option<Rect>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GalleryLayout {
+    pub(crate) image_area: ImageArea,
+    pub(crate) previous_button: Option<Rect>,
+    pub(crate) previous_area: Option<ImageArea>,
+    pub(crate) next_button: Option<Rect>,
+    pub(crate) next_area: Option<ImageArea>,
+    pub(crate) close_button: Option<Rect>,
+    pub(crate) close_area: Option<ImageArea>,
+    pub(crate) counter_area: Option<ImageArea>,
 }
 
 pub(crate) fn ui_layout(source_width: u32, source_height: u32) -> UiLayout {
@@ -86,6 +99,7 @@ pub(crate) fn ui_layout(source_width: u32, source_height: u32) -> UiLayout {
     let shutter_area = shutter_slot.and_then(|slot| shutter_area(slot, cell_width, cell_height));
     let capture_button = shutter_area.map(capture_hitbox);
     let thumbnail_area = thumbnail_area(sidebar, rows, cell_width, cell_height, shutter_area);
+    let thumbnail_button = thumbnail_area.map(image_hitbox);
 
     UiLayout {
         preview_area: fit_image_area(
@@ -106,6 +120,61 @@ pub(crate) fn ui_layout(source_width: u32, source_height: u32) -> UiLayout {
         recording_timer_area,
         no_mic_area,
         thumbnail_area,
+        thumbnail_button,
+    }
+}
+
+pub(crate) fn gallery_layout() -> GalleryLayout {
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let image_area = ImageArea {
+        x: 0,
+        y: 0,
+        cols: cols.max(1),
+        rows: rows.max(1),
+    };
+
+    let navigation_rows = 3.min(rows);
+    let navigation_cols = 6.min(cols / 3);
+    let show_navigation = cols >= 18 && rows >= 6;
+    let previous_button = show_navigation.then_some(Rect {
+        x: 1,
+        y: rows.saturating_sub(navigation_rows) / 2,
+        cols: navigation_cols,
+        rows: navigation_rows,
+    });
+    let next_button = show_navigation.then_some(Rect {
+        x: cols.saturating_sub(navigation_cols + 1),
+        y: rows.saturating_sub(navigation_rows) / 2,
+        cols: navigation_cols,
+        rows: navigation_rows,
+    });
+
+    let close_cols = 6.min(cols);
+    let close_rows = 3.min(rows);
+    let close_button = (cols >= 9 && rows >= 4).then_some(Rect {
+        x: cols.saturating_sub(close_cols + 1),
+        y: 1,
+        cols: close_cols,
+        rows: close_rows,
+    });
+
+    let counter_cols = 12.min(cols.saturating_sub(2));
+    let counter_area = (cols >= 12 && rows >= 4).then_some(ImageArea {
+        x: cols.saturating_sub(counter_cols) / 2,
+        y: rows.saturating_sub(3),
+        cols: counter_cols,
+        rows: 2,
+    });
+
+    GalleryLayout {
+        image_area,
+        previous_button,
+        previous_area: previous_button.map(rect_image_area),
+        next_button,
+        next_area: next_button.map(rect_image_area),
+        close_button,
+        close_area: close_button.map(rect_image_area),
+        counter_area,
     }
 }
 
@@ -333,11 +402,24 @@ fn shutter_area(button: Rect, cell_width: f64, cell_height: f64) -> Option<Image
 }
 
 fn capture_hitbox(area: ImageArea) -> Rect {
+    image_hitbox(area)
+}
+
+fn image_hitbox(area: ImageArea) -> Rect {
     Rect {
         x: area.x,
         y: area.y,
         cols: area.cols,
         rows: area.rows,
+    }
+}
+
+fn rect_image_area(rect: Rect) -> ImageArea {
+    ImageArea {
+        x: rect.x,
+        y: rect.y,
+        cols: rect.cols,
+        rows: rect.rows,
     }
 }
 

@@ -10,7 +10,7 @@ use super::{
         KITTY_GALLERY_PREVIOUS_PLACEMENT_ID, KITTY_MODE_IMAGE_ID, KITTY_MODE_PLACEMENT_ID,
         KITTY_NO_MIC_IMAGE_ID, KITTY_NO_MIC_PLACEMENT_ID, KITTY_SELF_TIMER_IMAGE_ID,
         KITTY_SELF_TIMER_PLACEMENT_ID, KITTY_SHUTTER_IMAGE_ID, KITTY_SHUTTER_PLACEMENT_ID,
-        KITTY_TIMER_IMAGE_ID, KITTY_TIMER_PLACEMENT_ID, KittyFramePlacement, write_kitty_image,
+        KITTY_TIMER_PLACEMENT_ID, KittyFramePlacement, write_kitty_image,
     },
     layout::{ImageArea, UiLayout},
     raster::*,
@@ -147,16 +147,18 @@ pub(crate) fn write_kitty_recording_timer(
     out: &mut impl Write,
     area: ImageArea,
     elapsed: std::time::Duration,
+    image_id: u32,
+    previous_image_id: Option<u32>,
     sequence: &mut Vec<u8>,
 ) -> io::Result<()> {
     let frame = recording_timer_rgba(RECORDING_TIMER_WIDTH, RECORDING_TIMER_HEIGHT, elapsed);
     write_kitty_image(
         out,
         KittyFramePlacement {
-            image_id: KITTY_TIMER_IMAGE_ID,
+            image_id,
             placement_id: KITTY_TIMER_PLACEMENT_ID,
             z_index: TIMER_Z_INDEX,
-            previous_image_id: None,
+            previous_image_id,
             width: RECORDING_TIMER_WIDTH,
             height: RECORDING_TIMER_HEIGHT,
             area,
@@ -1120,11 +1122,14 @@ mod tests {
         };
         let mut out = Vec::new();
         let mut scratch = Vec::new();
+        let timer_ids = super::super::kitty_graphics::KITTY_TIMER_IMAGE_IDS;
 
         write_kitty_recording_timer(
             &mut out,
             area,
             std::time::Duration::from_secs(65),
+            timer_ids[1],
+            Some(timer_ids[0]),
             &mut scratch,
         )
         .expect("recording timer should encode");
@@ -1132,8 +1137,10 @@ mod tests {
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("\x1b[2;4H"));
         assert!(text.contains("a=T,q=2,f=32,s=224,v=48"));
-        assert!(text.contains(&format!("i={KITTY_TIMER_IMAGE_ID}")));
+        let transmit = text.find(&format!("i={}", timer_ids[1])).unwrap();
+        let delete = text.rfind(&format!("i={}", timer_ids[0])).unwrap();
         assert!(text.contains(&format!("p={KITTY_TIMER_PLACEMENT_ID}")));
+        assert!(transmit < delete);
     }
 
     #[test]

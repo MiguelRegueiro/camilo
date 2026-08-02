@@ -16,7 +16,7 @@ pub(crate) use input::{
 pub(crate) use kitty_graphics::{
     KITTY_COUNTDOWN_IMAGE_ID, KITTY_GALLERY_IMAGE_IDS, KITTY_GALLERY_PLACEMENT_ID, KITTY_IMAGE_IDS,
     KITTY_NO_MIC_IMAGE_ID, KITTY_PLACEMENT_ID, KITTY_THUMBNAIL_IMAGE_IDS,
-    KITTY_THUMBNAIL_PLACEMENT_ID, KITTY_TIMER_IMAGE_ID, KittyFramePlacement,
+    KITTY_THUMBNAIL_PLACEMENT_ID, KITTY_TIMER_IMAGE_IDS, KittyFramePlacement,
     clear_screen_and_images, write_kitty_delete_image, write_kitty_rgb_frame,
 };
 pub(crate) use layout::{GalleryLayout, gallery_layout, image_area_pixel_size, ui_layout};

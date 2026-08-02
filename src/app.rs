@@ -20,7 +20,7 @@ use crate::{
         CaptureMode, GalleryInputTargets, GalleryLayout, InputTargets, KITTY_COUNTDOWN_IMAGE_ID,
         KITTY_GALLERY_IMAGE_IDS, KITTY_GALLERY_PLACEMENT_ID, KITTY_IMAGE_IDS,
         KITTY_NO_MIC_IMAGE_ID, KITTY_PLACEMENT_ID, KITTY_THUMBNAIL_IMAGE_IDS,
-        KITTY_THUMBNAIL_PLACEMENT_ID, KITTY_TIMER_IMAGE_ID, KittyFramePlacement, SelfTimer,
+        KITTY_THUMBNAIL_PLACEMENT_ID, KITTY_TIMER_IMAGE_IDS, KittyFramePlacement, SelfTimer,
         TerminalGuard, clear_screen_and_images, drain_gallery_input_events, drain_input_events,
         draw_sidebar, enable_tmux_passthrough, gallery_layout, image_area_pixel_size, inside_tmux,
         looks_like_kitty, refresh_tmux_pane_origin, spawn_input_thread, ui_layout,
@@ -38,6 +38,8 @@ struct ActiveRecording {
     next_frame_at: Instant,
     frame_interval: Duration,
     last_timer_second: Option<u64>,
+    timer_image_serial: u32,
+    timer_image_id: Option<u32>,
 }
 
 struct PendingRecordingStop {
@@ -293,6 +295,10 @@ pub(crate) fn run() -> Result<()> {
                 if let Some(countdown) = countdown.as_mut() {
                     countdown.last_visible_second = None;
                 }
+                if let Some(recording) = recording.as_mut() {
+                    recording.last_timer_second = None;
+                    recording.timer_image_id = None;
+                }
             }
             layout = next_layout;
             last_layout = Some(layout);
@@ -356,10 +362,13 @@ pub(crate) fn run() -> Result<()> {
                     }
                     CaptureMode::Video => {
                         if let Some(recording) = recording.take() {
+                            let timer_image_id = recording.timer_image_id;
                             pending_recording_stops.push(PendingRecordingStop {
                                 handle: recording.encoder.stop_async(),
                             });
-                            write_kitty_delete_image(&mut out, KITTY_TIMER_IMAGE_ID)?;
+                            if let Some(image_id) = timer_image_id {
+                                write_kitty_delete_image(&mut out, image_id)?;
+                            }
                             if no_mic_visible {
                                 write_kitty_delete_image(&mut out, KITTY_NO_MIC_IMAGE_ID)?;
                                 no_mic_visible = false;
@@ -422,7 +431,18 @@ pub(crate) fn run() -> Result<()> {
             let elapsed = recording.started_at.elapsed();
             let elapsed_second = elapsed.as_secs();
             if recording.last_timer_second != Some(elapsed_second) {
-                write_kitty_recording_timer(&mut out, area, elapsed, &mut kitty_sequence)?;
+                let image_id = KITTY_TIMER_IMAGE_IDS
+                    [(recording.timer_image_serial as usize) % KITTY_TIMER_IMAGE_IDS.len()];
+                write_kitty_recording_timer(
+                    &mut out,
+                    area,
+                    elapsed,
+                    image_id,
+                    recording.timer_image_id,
+                    &mut kitty_sequence,
+                )?;
+                recording.timer_image_id = Some(image_id);
+                recording.timer_image_serial = recording.timer_image_serial.wrapping_add(1);
                 recording.last_timer_second = Some(elapsed_second);
             }
         }
@@ -688,6 +708,8 @@ fn start_recording(
         next_frame_at: now,
         frame_interval: recording_frame_interval(config.fps),
         last_timer_second: None,
+        timer_image_serial: 0,
+        timer_image_id: None,
     })
 }
 

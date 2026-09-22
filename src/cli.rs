@@ -10,8 +10,12 @@ pub(crate) fn config_from_env() -> Result<Config> {
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Config> {
     let args = args.collect::<Vec<_>>();
-    if args.iter().any(|arg| arg == "--help") {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_help();
+        std::process::exit(0);
+    }
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        print_version();
         std::process::exit(0);
     }
 
@@ -29,7 +33,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Config> {
                 config.width = parse_positive_arg(&arg, args.next())?;
                 config.width_set = true;
             }
-            "-h" | "--height" => {
+            "-H" | "--height" => {
                 config.height = parse_positive_arg(&arg, args.next())?;
                 config.height_set = true;
             }
@@ -90,17 +94,40 @@ fn parse_positive_arg(flag: &str, value: Option<String>) -> Result<u32> {
 fn print_help() {
     println!(
         "\
-camilo - camera app for the terminal
+Usage: camilo [OPTIONS]
 
-Usage:
-  camilo [--device /dev/video0] [--width 1920] [--height 1080] [--fps 30] [--preview-backend auto|v4l2|ffmpeg] [--picture-dir ~/Pictures/Camera] [--video-dir ~/Videos/Camera] [--mirror-horizontal] [--no-mirror-horizontal] [--audio-input default] [--no-audio] [--force] [--camera-info]
+Terminal camera app for Kitty.
 
-Controls:
-  Right-side shutter button  take pictures or start/stop video recording
-  Right-side mode switch     toggle photo/video mode
-  q                          exit
+Camera:
+  -d, --device <PATH>              Select the V4L2 camera device
+  -w, --width <PX>                 Set the camera width
+  -H, --height <PX>                Set the camera height
+  -f, --fps <FPS>                  Set the camera frame rate
+      --preview-backend <BACKEND>  Select auto, v4l2, or ffmpeg [default: auto]
+      --camera-info                Print selected camera mode information and exit
+
+Preview:
+      --mirror-horizontal          Mirror the live preview
+      --no-mirror-horizontal       Do not mirror the live preview
+
+Recording:
+      --audio-input <NAME>         Select the microphone/input for video recording
+      --no-audio                   Record video without audio
+
+Output:
+      --picture-dir <PATH>         Save photos in PATH
+      --video-dir <PATH>           Save videos in PATH
+
+General:
+      --force                      Skip the Kitty environment check
+  -h, --help                       Print help
+  -V, --version                    Print version
 "
     );
+}
+
+fn print_version() {
+    println!("camilo {}", env!("CARGO_PKG_VERSION"));
 }
 
 #[cfg(test)]
@@ -122,7 +149,7 @@ mod tests {
             [
                 "--width".to_string(),
                 "640".to_string(),
-                "--height".to_string(),
+                "-H".to_string(),
                 "360".to_string(),
             ]
             .into_iter(),
@@ -132,6 +159,15 @@ mod tests {
         assert_eq!(config.width, 640);
         assert_eq!(config.height, 360);
         assert!(config.width_set);
+        assert!(config.height_set);
+    }
+
+    #[test]
+    fn long_height_flag_marks_preview_height_explicit() {
+        let config = parse_args(["--height".to_string(), "360".to_string()].into_iter())
+            .expect("height should parse");
+
+        assert_eq!(config.height, 360);
         assert!(config.height_set);
     }
 

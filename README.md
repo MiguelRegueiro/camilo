@@ -45,7 +45,7 @@ Flags:
 - `--audio-input <name>` — choose the microphone/input used for video recording
 - `--no-audio` — record video without audio
 - `--camera-info` — print selected camera mode information and exit
-- `--force` — run on compatible terminals that do not advertise themselves as Kitty
+- `--force` — bypass Kitty terminal detection
 
 ## Config
 

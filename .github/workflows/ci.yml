@@ -35,6 +35,11 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install test dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

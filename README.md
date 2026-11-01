@@ -20,9 +20,7 @@ Take photos, record videos, and control the camera from a terminal UI.
 
 On FreeBSD, expose webcams with `webcamd`, usually as `/dev/video0`.
 
-## Install
-
-Once published, install the latest release from crates.io with:
+## Install from crates.io
 
 ```sh
 cargo install camilo

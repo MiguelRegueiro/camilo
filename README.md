@@ -20,6 +20,14 @@ Take photos, record videos, and control the camera from a terminal UI.
 
 On FreeBSD, expose webcams with `webcamd`, usually as `/dev/video0`.
 
+## Install
+
+Once published, install the latest release from crates.io with:
+
+```sh
+cargo install camilo
+```
+
 ## Run from source
 
 Install Rust 1.96+ and the native camera/media dependencies, then run:

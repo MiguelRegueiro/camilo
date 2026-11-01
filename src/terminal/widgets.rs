@@ -1172,7 +1172,7 @@ mod tests {
         assert_eq!(frame[3], 0);
         assert!(frame[center + 3] > 0);
         assert!(
-            frame.chunks_exact(4).any(|pixel| {
+            frame.as_chunks::<4>().0.iter().any(|pixel| {
                 pixel[0] > 180 && pixel[1] > 180 && pixel[2] > 180 && pixel[3] > 180
             })
         );
@@ -1188,7 +1188,7 @@ mod tests {
         );
         assert_eq!(frame[3], 0);
         assert!(
-            frame.chunks_exact(4).any(|pixel| {
+            frame.as_chunks::<4>().0.iter().any(|pixel| {
                 pixel[0] > 180 && pixel[1] > 180 && pixel[2] > 180 && pixel[3] > 180
             })
         );

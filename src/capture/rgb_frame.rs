@@ -112,7 +112,8 @@ pub(super) fn convert_yuyv_to_rgb24(
     }
 
     let mut dst = 0;
-    for chunk in frame[..expected_in].chunks_exact(4) {
+    let (chunks, _) = frame[..expected_in].as_chunks::<4>();
+    for chunk in chunks {
         let y0 = chunk[0];
         let u = chunk[1];
         let y1 = chunk[2];
@@ -254,7 +255,9 @@ impl Rgb24Scaler {
             let top_row = &src[vertical.lower_offset..vertical.lower_offset + src_stride];
             let bottom_row = &src[vertical.upper_offset..vertical.upper_offset + src_stride];
             for (dst_pixel, horizontal) in dst_row
-                .chunks_exact_mut(RAW_RGB_BYTES_PER_PIXEL)
+                .as_chunks_mut::<RAW_RGB_BYTES_PER_PIXEL>()
+                .0
+                .iter_mut()
                 .zip(&self.horizontal)
             {
                 for channel in 0..RAW_RGB_BYTES_PER_PIXEL {

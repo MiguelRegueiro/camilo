@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.96"
 description = "Terminal camera app for Kitty"
 license = "MIT"
+repository = "https://github.com/MiguelRegueiro/camilo"
+homepage = "https://github.com/MiguelRegueiro/camilo"
+categories = ["command-line-utilities", "multimedia::images"]
+keywords = ["camera", "terminal", "kitty", "v4l2", "webcam"]
 
 [dependencies]
 anyhow = "1.0"

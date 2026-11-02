@@ -1,0 +1,113 @@
+name: Backfill Linux release asset
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable release tag to receive the portable Linux archive
+        required: true
+        default: v1.0.0
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-upload:
+    name: Build and upload portable Linux archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tag must use stable SemVer: vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+
+          version="${RELEASE_TAG#v}"
+          manifest_version="$(awk '
+            /^\[package\]$/ { in_package = 1; next }
+            /^\[/ { in_package = 0 }
+            in_package && /^version = / { gsub(/^version = "|"$/, ""); print; exit }
+          ' Cargo.toml)"
+          if [[ "${manifest_version}" != "${version}" ]]; then
+            echo "${RELEASE_TAG} does not match Cargo.toml version ${manifest_version}" >&2
+            exit 1
+          fi
+
+      - name: Build and package portable Linux archive
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${RELEASE_TAG#v}"
+          host_target="$(rustc -vV | sed -n 's/^host: //p')"
+          bundle="camilo-${version}-${host_target}"
+          stage_root="${RUNNER_TEMP}/camilo-release-stage"
+          archive="${RUNNER_TEMP}/${bundle}.tar.gz"
+          source_date_epoch="$(git log -1 --format=%ct)"
+
+          cargo build --locked --release
+
+          rm -rf "${stage_root}"
+          mkdir -p "${stage_root}/${bundle}/share"
+          install -Dm755 target/release/camilo "${stage_root}/${bundle}/camilo"
+          install -Dm644 README.md CHANGELOG.md LICENSE -t "${stage_root}/${bundle}"
+          install -Dm644 packaging/linux/camilo.desktop \
+            "${stage_root}/${bundle}/share/camilo.desktop"
+          cp -R packaging/linux/icons "${stage_root}/${bundle}/share/icons"
+
+          tar \
+            --sort=name \
+            --mtime="@${source_date_epoch}" \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C "${stage_root}" \
+            -cf - "${bundle}" \
+            | gzip -n > "${archive}"
+
+          for entry in \
+            "${bundle}/camilo" \
+            "${bundle}/README.md" \
+            "${bundle}/CHANGELOG.md" \
+            "${bundle}/LICENSE" \
+            "${bundle}/share/camilo.desktop" \
+            "${bundle}/share/icons/hicolor/512x512/apps/camilo.png"; do
+            tar -tzf "${archive}" "${entry}" >/dev/null
+          done
+
+          mkdir -p dist
+          mv "${archive}" "dist/${bundle}.tar.gz"
+          sha256sum "dist/${bundle}.tar.gz"
+
+      - name: Upload archive to existing GitHub release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "${RELEASE_TAG}" >/dev/null
+          gh release upload "${RELEASE_TAG}" dist/*.tar.gz --clobber
